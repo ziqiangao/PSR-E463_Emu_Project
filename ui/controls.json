@@ -1,0 +1,75 @@
+{
+  "artwork": "../PSR-E463.svg",
+  "character_rom": "character_rom.json",
+  "controls": [
+    { "svg_id": "Power-2" },
+    { "svg_id": "LiveControl" }
+  ],
+  "interactive_groups": [
+    { "svg_id": "Buttons" },
+    { "svg_id": "LEDButtons" }
+  ],
+  "knobs": {
+    "regular": {
+      "min_angle_deg": -135,
+      "max_angle_deg": 135,
+      "center_value": 64,
+      "value_min": 0,
+      "value_max": 127,
+      "center_snap_radius": 6,
+      "center_snap_ids": ["LiveControlA", "LiveControlB"],
+      "centers": [
+        { "svg_id": "LiveControlA", "x": 352.3, "y": 405.99 },
+        { "svg_id": "LiveControlB", "x": 415.4, "y": 405.99 },
+        { "svg_id": "MasterVolume-2", "x": 510.74, "y": 257.17 }
+      ]
+    },
+    "rotary": {
+      "svg_id": "Dial",
+      "center_x": 1280.44,
+      "center_y": 177.47,
+      "step_deg": 15
+    }
+  },
+  "piano": {
+    "selector": "KeyboardOct",
+    "computer_keys": ["z", "s", "x", "d", "c", "v", "g", "b", "h", "n", "j", "m"],
+    "minimum_octave": 1,
+    "maximum_octave": 5,
+    "initial_octave": 3,
+    "initial_contact_delay_ms": 100,
+    "contact_delay_step_ms": 10
+  },
+  "shortcuts": {
+    "octave_up": "KP_Multiply",
+    "octave_down": "KP_Divide",
+    "ten_key": {
+      "kp_1": "Tenkey1",
+      "kp_2": "Tenkey2",
+      "kp_3": "Tenkey3",
+      "kp_4": "Tenkey4",
+      "kp_5": "Tenkey5",
+      "kp_6": "Tenkey6",
+      "kp_7": "Tenkey7",
+      "kp_8": "Tenkey8",
+      "kp_9": "Tenkey9",
+      "kp_0": "Tenkey0",
+      "kp_add": "TenkeyPlus",
+      "kp_subtract": "TenkeyMinus"
+    }
+  },
+  "switch_codes_by_id": {
+    "Tenkey0": "09", "Tenkey1": "00", "Tenkey2": "01", "Tenkey3": "02",
+    "Tenkey4": "03", "Tenkey5": "04", "Tenkey6": "05", "Tenkey7": "06",
+    "Tenkey8": "07", "Tenkey9": "08", "TenkeyPlus": "0A", "TenkeyMinus": "0B",
+    "CategoryRight": "0C", "CategoryLeft": "0D", "Voice": "12", "Style": "13",
+    "Groove": "14", "Groove-2": "14", "TapTempo": "15", "Song": "18",
+    "Song-2": "18", "Demo": "1A", "Transpose": "1B", "Metronome": "1D",
+    "PortableGrand": "1E", "HarmonyArpeggio": "20", "Dual-2": "23", "Split-2": "24",
+    "FastForward": "32", "Pause": "34", "ABRepeat": "36", "Rewind": "39",
+    "PlayStop": "3C", "Track1": "3E", "Track2": "3F", "Track3": "40",
+    "Track4": "41", "Track5": "42", "Track6": "43", "RegMemBank": "44",
+    "RegMen1": "45", "RegMem2": "46", "RegMem3": "47", "RegMem4": "48",
+    "QuickSampler": "4C"
+  }
+}

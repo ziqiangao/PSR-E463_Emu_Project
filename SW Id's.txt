@@ -1,0 +1,43 @@
+SW Id's
+
+00-09: 10 key
+0A/0B: 10 Key +/-
+0C: Jump +15
+0D: Jump -15
+0E/0F: Catagory >>/<<
+
+12:VOICE
+13:STYLE
+14:GROOVE CREATOR
+15:Tap Tempo
+16: Tempo+
+17: Tempo-
+18: SONG
+19: Left/Right
+1A: DEMO
+1B: TRANSPOSE
+1C: Style Volume
+1D: Metronone
+1E: PORTABLE GRAND
+20: Harmony
+21: Apeggio
+22: Function start
+23: DUAL
+24: SPLIT
+26: Practice - Listen1
+27/28/29: Track State
+2a: Practice - Waiting mode
+2b: Practice - Your Tempo mode
+2c: Practice - Minus One mode
+2e: Performence Assistant
+32: FF
+34: Pause
+36: AB-B Repeat
+39: RW
+3C: Play/Stop
+3e: Track 1 Toggle
+3f: Track 2 Toggle
+40-43: Track 3-5/A Toggle
+44: Registration Bank
+45-48: Registration Mem 1-4
+4C: Quick Sample

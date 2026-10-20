@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>MIDI ASCII Shell</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            background: #000;
+            color: #aaa;
+            font-family: monospace;
+            font-size: 14px;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        #toolbar {
+            height: 40px;
+            flex-shrink: 0;
+
+            display: flex;
+            align-items: center;
+            gap: 8px;
+
+            padding: 0 10px;
+
+            background: #111;
+            border-bottom: 1px solid #333;
+
+            font-size: 12px;
+        }
+
+        button {
+            font-family: monospace;
+            font-size: 12px;
+
+            padding: 4px 9px;
+
+            color: #aaa;
+            background: #111;
+
+            border: 1px solid #444;
+
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #222;
+            color: #fff;
+        }
+
+        #status {
+            color: #666;
+        }
+
+        #status.connected {
+            color: #aaa;
+        }
+
+        #status.error {
+            color: #777;
+        }
+
+        #terminal {
+            flex: 1;
+
+            position: relative;
+
+            overflow-y: auto;
+
+            padding: 10px;
+
+            outline: none;
+
+            cursor: text;
+
+            /*
+             * Keep whitespace exactly as the remote shell sends it.
+             */
+            white-space: pre;
+
+            /*
+             * Classic terminal behaviour.
+             */
+            font-family:
+                "Courier New",
+                Courier,
+                monospace;
+
+            line-height: 1.2;
+        }
+
+        #screen {
+            display: inline;
+
+            /*
+             * Preserve ASCII spacing.
+             */
+            white-space: pre;
+        }
+
+        /*
+         * Actual terminal cursor.
+         *
+         * It is deliberately a block rather than a browser text
+         * caret, because this is intended to look like an old
+         * ASCII terminal.
+         */
+        #cursor {
+            display: inline-block;
+
+            width: 8px;
+            height: 15px;
+
+            background: #aaa;
+
+            vertical-align: -2px;
+
+            animation: cursor-blink 1s steps(1) infinite;
+        }
+
+        #cursor.hidden {
+            display: none;
+        }
+
+        @keyframes cursor-blink {
+            50% {
+                visibility: hidden;
+            }
+        }
+
+        /*
+         * Hidden input is only used to keep keyboard focus.
+         */
+        #keyboard {
+            position: fixed;
+
+            left: -10000px;
+            top: -10000px;
+
+            width: 1px;
+            height: 1px;
+
+            opacity: 0;
+
+            border: 0;
+            padding: 0;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="toolbar">
+        <button id="connect">Connect MIDI</button>
+        <button id="clear">Clear</button>
+
+        <span id="status">
+            Disconnected
+        </span>
+    </div>
+
+
+    <div id="terminal" tabindex="0"><span id="screen"></span><span id="cursor"></span></div>
+
+
+    <input id="keyboard" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+
+
+    <script>
+        "use strict";
+
+
+        /* ============================================================
+         * Configuration
+         * ============================================================ */
+
+        const MIDI_PORT_NAME = "Digital Keyboard";
+
+        const SYSEX_HEADER = [
+            0x43,
+            0x73,
+            0x01,
+            0x52,
+            0x19,
+            0x00,
+            0x00
+        ];
+
+
+        /* ============================================================
+         * State
+         * ============================================================ */
+
+        let midi = null;
+
+        let midiInput = null;
+        let midiOutput = null;
+
+
+        /* ============================================================
+         * DOM
+         * ============================================================ */
+
+        const terminal = document.getElementById("terminal");
+        const screen = document.getElementById("screen");
+        const cursor = document.getElementById("cursor");
+        const keyboard = document.getElementById("keyboard");
+        const status = document.getElementById("status");
+
+
+        /* ============================================================
+         * Terminal screen
+         * ============================================================ */
+
+        /*
+         * The screen is represented as actual text.
+         *
+         * We deliberately do not maintain a local input buffer.
+         *
+         * What you type:
+         *
+         *     browser → MIDI → remote shell
+         *
+         * What appears:
+         *
+         *     remote shell → MIDI → browser
+         *
+         * This means the remote shell remains authoritative.
+         */
+
+
+        function writeCharacter(character) {
+
+            /*
+             * Backspace
+             *
+             * Delete the character immediately before the cursor.
+             *
+             * IMPORTANT:
+             *
+             * This happens ONLY when a backspace is received from MIDI.
+             */
+            if (character === "\b") {
+                deletePreviousCharacter();
+                return;
+            }
+
+
+            /*
+             * Carriage return.
+             *
+             * ASCII CR moves the cursor to the beginning of the
+             * current line.
+             *
+             * Since the browser's text layout doesn't have a true
+             * terminal cursor position, handle this by removing the
+             * current line and putting it back at the beginning.
+             */
+            if (character === "\r") {
+                carriageReturn();
+                return;
+            }
+
+
+            /*
+             * Line feed.
+             */
+            if (character === "\n") {
+                screen.appendChild(
+                    document.createTextNode("\n")
+                );
+
+                scrollToBottom();
+
+                return;
+            }
+
+
+            /*
+             * Tab.
+             *
+             * Use an actual tab so the browser's monospace rendering
+             * handles it as terminal whitespace.
+             */
+            if (character === "\t") {
+                screen.appendChild(
+                    document.createTextNode("\t")
+                );
+
+                scrollToBottom();
+
+                return;
+            }
+
+
+            /*
+             * Ignore other ASCII control characters.
+             *
+             * Examples:
+             *
+             *     NUL  0x00
+             *     BEL  0x07
+             *     ESC  0x1B
+             *
+             * ESC is handled separately below.
+             */
+            const code = character.charCodeAt(0);
+
+            if (code < 0x20 || code === 0x7f) {
+                return;
+            }
+
+
+            /*
+             * Normal ASCII character.
+             */
+            screen.appendChild(
+                document.createTextNode(character)
+            );
+
+            scrollToBottom();
+        }
+
+
+        /*
+         * Delete the character immediately before the cursor.
+         *
+         * Because the cursor is rendered separately from the text,
+         * the final text node is the character immediately before it.
+         */
+        function deletePreviousCharacter() {
+
+            const node = screen.lastChild;
+
+            if (!node) {
+                return;
+            }
+
+
+            /*
+             * Text node.
+             */
+            if (node.nodeType === Node.TEXT_NODE) {
+
+                if (node.textContent.length > 0) {
+
+                    node.textContent =
+                        node.textContent.slice(
+                            0,
+                            -1
+                        );
+
+                }
+
+                if (node.textContent.length === 0) {
+                    screen.removeChild(node);
+                }
+
+                return;
+            }
+
+
+            /*
+             * Fallback for any unexpected node.
+             */
+            screen.removeChild(node);
+        }
+
+
+        /*
+         * Handle carriage return.
+         *
+         * Find the text after the most recent newline and remove it.
+         *
+         * This gives us the usual shell behaviour:
+         *
+         *     hello\r
+         *
+         * moves back to the beginning of that line.
+         */
+        function carriageReturn() {
+
+            const text = screen.textContent;
+
+            const lastNewline =
+                text.lastIndexOf("\n");
+
+
+            /*
+             * Remove everything after the last newline.
+             */
+            const newText =
+                text.substring(
+                    0,
+                    lastNewline + 1
+                );
+
+
+            screen.textContent = newText;
+
+            scrollToBottom();
+        }
+
+
+        /*
+         * Clear the terminal.
+         */
+        function clearScreen() {
+            screen.textContent = "";
+            scrollToBottom();
+        }
+
+
+        /*
+         * Keep the cursor at the bottom of the visible terminal.
+         */
+        function scrollToBottom() {
+            terminal.scrollTop =
+                terminal.scrollHeight;
+        }
+
+
+        /* ============================================================
+         * MIDI output
+         * ============================================================ */
+
+
+        /*
+         * Convert a string to the exact nibble format used by Python.
+         */
+        function encodeString(text) {
+
+            const payload = [];
+
+            for (const character of text) {
+
+                const value =
+                    character.charCodeAt(0) & 0xff;
+
+                payload.push(
+                    (value >> 4) & 0x0f,
+                    value & 0x0f
+                );
+            }
+
+            return payload;
+        }
+
+
+        /*
+         * Send a string to the keyboard/remote shell.
+         */
+        function sendString(text) {
+
+            if (!midiOutput) {
+                return;
+            }
+
+
+            const payload =
+                encodeString(text);
+
+
+            const message = [
+                0xF0,
+
+                ...SYSEX_HEADER,
+
+                ...payload,
+
+                0xF7
+            ];
+
+
+            try {
+                midiOutput.send(message);
+            }
+            catch (error) {
+                console.error(
+                    "MIDI send failed:",
+                    error
+                );
+            }
+        }
+
+
+        /* ============================================================
+         * MIDI input
+         * ============================================================ */
+
+
+        /*
+         * Decode an incoming SysEx packet.
+         */
+        function handleMIDIMessage(event) {
+
+            const bytes =
+                Array.from(event.data);
+
+
+            /*
+             * Only process SysEx.
+             */
+            if (
+                bytes.length < 2 ||
+                bytes[0] !== 0xF0 ||
+                bytes[bytes.length - 1] !== 0xF7
+            ) {
+                return;
+            }
+
+
+            /*
+             * Strip F0/F7.
+             *
+             * This corresponds to mido's representation.
+             */
+            const data =
+                bytes.slice(1, -1);
+
+
+            /*
+             * Same check as Python:
+             *
+             * if len(data) < 9:
+             *     return
+             */
+            if (data.length < 9) {
+                return;
+            }
+
+
+            /*
+             * Same as:
+             *
+             * payload = data[7:]
+             */
+            const payload =
+                data.slice(7);
+
+
+            /*
+             * Reconstruct ASCII characters from pairs of nibbles.
+             */
+            for (
+                let i = 0;
+                i + 1 < payload.length;
+                i += 2
+            ) {
+
+                const high =
+                    payload[i];
+
+                const low =
+                    payload[i + 1];
+
+
+                const code =
+                    (high << 4) | low;
+
+
+                const character =
+                    String.fromCharCode(code);
+
+
+                /*
+                 * The Python code converts CR to LF:
+                 *
+                 * if c == '\r':
+                 *     c = '\n'
+                 *
+                 * Keep that behaviour.
+                 */
+                if (character === "\r") {
+                    writeCharacter("\n");
+                }
+                else {
+                    writeCharacter(character);
+                }
+            }
+        }
+
+
+        /* ============================================================
+         * MIDI connection
+         * ============================================================ */
+
+        function findMIDIPorts() {
+
+            midiInput = null;
+            midiOutput = null;
+
+
+            /*
+             * Find input.
+             */
+            for (const port of midi.inputs.values()) {
+                //console.log(port.name)
+                if (
+                    port.name.includes(MIDI_PORT_NAME)
+                ) {
+                    midiInput = port;
+                }
+            }
+
+
+            /*
+             * Find output.
+             */
+            for (const port of midi.outputs.values()) {
+                //console.log(port.name)
+                if (
+                    port.name.includes(MIDI_PORT_NAME)
+                ) {
+                    midiOutput = port;
+                }
+            }
+
+
+            return (
+                midiInput !== null &&
+                midiOutput !== null
+            );
+        }
+
+
+        function connectMIDI() {
+
+            if (!midi) {
+                return;
+            }
+
+
+            /*
+             * Remove an old listener.
+             */
+            if (midiInput) {
+                midiInput.onmidimessage = null;
+            }
+
+
+            if (!findMIDIPorts()) {
+
+                midiInput = null;
+                midiOutput = null;
+
+                status.textContent =
+                    "MIDI port not found";
+
+                status.className =
+                    "error";
+
+                return;
+            }
+
+
+            /*
+             * Start receiving.
+             */
+            midiInput.onmidimessage =
+                handleMIDIMessage;
+
+
+            status.textContent =
+                "Connected";
+
+            status.className =
+                "connected";
+
+
+            focusTerminal();
+        }
+
+
+        /* ============================================================
+         * MIDI initialisation
+         * ============================================================ */
+
+        async function initialiseMIDI() {
+
+            if (!navigator.requestMIDIAccess) {
+
+                status.textContent =
+                    "Web MIDI unavailable";
+
+                status.className =
+                    "error";
+
+                return;
+            }
+
+
+            try {
+
+                midi =
+                    await navigator.requestMIDIAccess({
+                        sysex: true
+                    });
+
+
+                /*
+                 * Automatically reconnect if the device appears,
+                 * disappears or is re-enumerated.
+                 */
+                midi.onstatechange =
+                    connectMIDI;
+
+
+                connectMIDI();
+
+            }
+            catch (error) {
+
+                console.error(error);
+
+                status.textContent =
+                    "MIDI permission denied";
+
+                status.className =
+                    "error";
+            }
+        }
+
+
+        /* ============================================================
+         * Keyboard input
+         * ============================================================ */
+
+        document.addEventListener(
+            "keydown",
+            event => {
+
+                /*
+                 * Ctrl+C
+                 *
+                 * Send ETX to the remote shell.
+                 */
+                if (
+                    event.ctrlKey &&
+                    event.key.toLowerCase() === "c"
+                ) {
+
+                    event.preventDefault();
+
+                    sendString(
+                        String.fromCharCode(0x03)
+                    );
+
+                    return;
+                }
+
+
+                /*
+                 * Backspace
+                 *
+                 * DO NOT alter the local display.
+                 *
+                 * Send ASCII BS to the remote shell.
+                 *
+                 * If the remote shell echoes BS back through MIDI,
+                 * handleMIDIMessage() will then delete the character.
+                 */
+                if (event.key === "Backspace") {
+
+                    event.preventDefault();
+
+                    sendString(
+                        String.fromCharCode(0x08)
+                    );
+
+                    return;
+                }
+
+
+                /*
+                 * Enter → CR.
+                 */
+                if (event.key === "Enter") {
+
+                    event.preventDefault();
+
+                    sendString(
+                        String.fromCharCode(0x0d)
+                    );
+
+                    return;
+                }
+
+
+                /*
+                 * Ignore browser/control shortcuts.
+                 */
+                if (
+                    event.ctrlKey ||
+                    event.altKey ||
+                    event.metaKey
+                ) {
+                    return;
+                }
+
+
+                /*
+                 * Normal printable ASCII.
+                 */
+                if (event.key.length === 1) {
+
+                    event.preventDefault();
+
+                    /*
+                     * Only send ASCII.
+                     */
+                    const code =
+                        event.key.charCodeAt(0);
+
+
+                    if (code >= 0x20 && code <= 0x7e) {
+
+                        sendString(event.key);
+                    }
+                }
+            }
+        );
+
+
+        /* ============================================================
+         * Focus
+         * ============================================================ */
+
+        function focusTerminal() {
+            terminal.focus();
+            keyboard.focus();
+        }
+
+
+        terminal.addEventListener(
+            "click",
+            focusTerminal
+        );
+
+
+        /* ============================================================
+         * Buttons
+         * ============================================================ */
+
+        document
+            .getElementById("connect")
+            .addEventListener(
+                "click",
+                initialiseMIDI
+            );
+
+
+        document
+            .getElementById("clear")
+            .addEventListener(
+                "click",
+                () => {
+                    clearScreen();
+                    focusTerminal();
+                }
+            );
+
+
+        /* ============================================================
+         * Initial state
+         * ============================================================ */
+
+        if (!navigator.requestMIDIAccess) {
+
+            status.textContent =
+                "Web MIDI unavailable";
+
+            status.className =
+                "error";
+
+        }
+        else {
+
+            status.textContent =
+                "Click Connect MIDI";
+        }
+    </script>
+
+</body>
+
+</html>
