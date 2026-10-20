@@ -1,6 +1,6 @@
 # PSR-E463 emulator: initial requirements and reverse-engineering notes
 
-Updated: 2026-10-18
+Updated: 2026-10-20
 
 Live-shell address guidance is tracked separately in [PSR_SHELL_ADDRESS_SAFETY.md](PSR_SHELL_ADDRESS_SAFETY.md). It distinguishes the exact read-only probes we have exercised from static Ghidra image ranges and unknown/unsafe write targets. No general-purpose safe write address has been confirmed.
 
@@ -50,7 +50,31 @@ The surrounding `FUN_600b177e` setup calls `FUN_600b84e2` with the USB product s
 
 The emulator maps the `0x40005000` page and observes writes to `0x40005028`. Its provisional model treats bit 1 as USB host enable and bit 2 as USB device enable. The virtual USB TO DEVICE host and USB TO HOST device stay disconnected; no mass-storage device, USB audio stream, or USB MIDI peer is synthesized. The register backing allows firmware read-modify-write setup to continue, while the controller model reports no attached peer.
 
-The follow-on write fault at `PC=0x600c9a7e`, `address=0x420a0508`, is the Cortex-M peripheral bit-band alias for bit 2 of `0x40005028`: alias offset `0x000a0508` decodes to peripheral byte offset `0x5028`, bit 2. Ghidra's `DAT_600ca218` contains this alias address, and `FUN_600c9a76` writes `1` to it to set the USB-device enable bit. `src/bitband.rs` now maps the peripheral alias window and translates alias reads/writes to the target peripheral bit. The 10-million-instruction smoke run passes this store and then exhausts its instruction budget in `FUN_600c9a76`'s polling loop at `PC=0x600c9a8a`, which reads `0x40000018`; the current zero-backed page does not advance this apparent delay counter. This is now a timer/peripheral modeling issue, not a USB port attach or bit-band fault.
+The follow-on write at `PC=0x600c9a7e`, `address=0x420a0508`, is the Cortex-M peripheral bit-band alias for bit 2 of `0x40005028`: alias offset `0x000a0508` decodes to peripheral byte offset `0x5028`, bit 2. Ghidra's `DAT_600ca218` contains this alias address, and the secondary-engine initializer writes `1` to it. `src/bitband.rs` maps the peripheral alias window and translates alias reads/writes to the target peripheral bit. Execution then polls the 16-bit counter at `0x40000018` for a 300-tick delay. The live, debug, and smoke-test runtimes advance that counter once per 1,024 guest instructions, a deterministic approximation rather than a hardware-accurate timer model. The secondary-engine control page and its 0x8000-byte configuration/RAM window are also mapped in all three runners. The start-request bit at `0x40030000` is modeled as completing on the next virtual timer tick; the true peripheral behavior is unconfirmed.
+
+### What the firmware-mapped placeholder pages appear to be
+
+I cross-checked the live and smoke-test mappings against Ghidra references,
+the traced firmware accesses, and the local service manual
+(`yamaha_psr-e463_sm.pdf`). The manual gives a boot-flow chart and board-level
+block/circuit diagrams, but not a SWX03 internal peripheral register map. It
+therefore helps identify external devices and pin roles, but cannot resolve
+most of these internal address pages.
+
+| Mapped page or region | What is supported by evidence | What remains a stand-in or unknown |
+|---|---|---|
+| `0x40000000..0x40000fff` | `0x40000018` is polled as a 16-bit counter in `InitializeSecondaryEngine`; `0x40000028` is polled by startup code. | Only the timer counter has deterministic virtual behavior. The counter's actual SWX03 timer/prescaler and the `0x40000028` status source are unidentified; the rest of the page is zero-backed. |
+| `0x40001000..0x40001fff` | GPIO register offsets `0x100..0x10a` and scan interface `0x112` are used. Ghidra and the manual identify PA3–PA10 as LCD data, PA11 as RS, PA12 as ENB, and PA2 as DAC reset. | GPIO state and LCD bus edges are modeled; scans are all-open by default. `--force-test-mode` injects the service chord's logical scan IDs, but physical matrix wiring remains unresolved. |
+| `0x40002000..0x40002fff` | A driver write of `0xf000` to `0x40002700` at `0x0100178e` is observed when this page is mapped. | No base-address references or manual diagram currently identify this page; it remains a zero-backed startup stub. |
+| `0x40004000..0x40004fff` | Firmware uses the transfer registers at `0x40004008..0x4000400e`; the service-manual diagram shows SWX03 serial-audio pins and the board's ADC/DAC/amp devices. | `0x4000400c` is routed to dummy DAC/amp sinks and `0x4000400e` is partially interpreted from firmware behavior. Register-to-pin mapping and device status behavior remain provisional. |
+| `0x40005000..0x40005fff` | `0x40005028` is a shared USB host/device enable/configuration word, inferred from the `USB000` storage path and `Digital Keyboard`/`iAP_Interface` setup. | Host and device peers remain disconnected; exact register and bit definitions are unconfirmed. |
+| `0x40008000..0x40008fff`, `0x40009000..0x40009fff`, `0x4000a000..0x4000afff` | Firmware startup and `FUN_60086824` write these blocks; Ghidra also finds writes to them in `FUN_68006bfc`. The initialization includes pointer/field values and the word `0x1589` at `0x40008000`. | They are a real firmware-touched startup interface, not arbitrary holes, but no manual page or traced consumer identifies the hardware block or register meanings. These pages remain zero-backed. |
+| `0xe000e000..0xe000efff` | Cortex-M system-control space; startup writes `SCB->VTOR` at `0xe000ed08`. | Basic exception entry/return, VTOR dispatch, NVIC enable/disable/pending/priority state, and PRIMASK/BASEPRI gating are modeled. SysTick countdown and device-to-IRQ wiring are not. |
+| `0x40030000..0x40030fff`, `0x40038000..0x4003ffff` | `InitializeSecondaryEngine` polls control bit 2, writes configuration fields and clears `0x7f00` bytes starting at `0x40038100`; its command helper accesses the `0x40038000` window. | The secondary-engine/DSP identification is context-based, not confirmed by the manual. The control bit auto-completion and memory window are firmware-progress stand-ins, not validated hardware models. |
+
+The virtual timer and secondary-engine startup behavior are thus the only
+purpose-built behavior behind otherwise placeholder startup pages. Do not use
+these emulator mappings to infer safe physical diagnostic-shell writes.
 
 ### `0x40004000` transfer block
 
@@ -156,10 +180,105 @@ input-scan controller through the pointer stored at `DAT_01000d08`. Ghidra
 bytes at that pointer resolve it to `0x40000112`. The service routine samples
 configured channels (up to 16), compares their snapshots, dispatches changes,
 and then calls `process_pending_input_events` at `0x0100037e`. The setup routine
-at `0x01000b2c` initializes this scan interface. This identifies a controller
-interface address, but does not establish the physical matrix row/column pin
-assignment or the meaning of every register field. The UI's CPU event model
-therefore reports symbolic SVG switch IDs and does not invent pin coordinates.
+at `0x01000b2c` initializes this scan interface. The lookup at `0x01000d30`
+assigns sequential scan IDs 1–90 across six bits per channel. The firmware's
+key-name pointer table starts with B0 at ID 1; C#2, F2, and G#2 are IDs 15, 19,
+and 22 respectively, mapping to channels 2/3 and bits 2/0/3. These are logical
+driver scan positions, not verified physical GPIO row/column pins. The
+`--force-test-mode` option supplies these three samples until the modeled LCD
+displays `TEST`; ordinary UI inputs remain symbolic until the physical matrix
+is resolved. The input-scan model has no verified IRQ source, so this override
+does not guarantee the firmware reaches the scan or test-mode path.
+
+`FUN_01006482` is the RTOS dispatcher/context-switch routine. It selects
+runnable tasks from the scheduler bitmaps, restores saved task contexts via
+SVC, and enters a busy loop when there are no ready groups. In that loop it
+enables IRQs and polls the ready-group byte at `0x0101732d`. A 10-million-
+instruction debugger run stops in this loop at `0x01006588`; at that point the
+current-task field at `0x0101732c` is `0xff`, and both the ready-group byte
+(`0x0101732d`) and first ready bitmap byte (`0x01017330`) are zero.
+
+The active task got as far as `FUN_6009f3de(1, 1)`, which calls
+`FUN_600b7924()` and then the driver wait API
+`thunk_EXT_FUN_01006a9a(4)`. This blocks on event 4; the scheduler itself is
+executing as designed, but no task is ready to dispatch. An observed producer
+of event 4 is the IRQ 9 handler at `0x600ac8fc`: it signals event 4 through
+`FUN_600bfbe6(..., 4)` when the status field at `0x40010024` reports code 5.
+That identifies a transfer-completion wake path, but does not yet prove that
+this particular boot-time wait initiated that transfer or identify the device
+that should produce the status.
+
+The startup sequence reaches `0x600b698a`, which calls `FUN_6008bb8c`. That
+initializer registers the input driver through `FUN_01000b2c`, configures
+`0x40000112`, and enables the driver's state flag. Thus input-scan
+initialization runs, but the periodic service at `0x01000836` is not reached
+in the debugger run. It has no direct static code references; its actual
+callback/interrupt source remains unresolved. Do not equate the zero
+ready-group byte with a keyboard queue or assign it to an IRQ without more
+evidence.
+
+The driver image's vector table at `0x01010000` is selected by the firmware's
+`SCB->VTOR` write. Its SVC vector (exception 11) points to `0x0100aff5`, a
+Thumb trampoline to `0x01006860`; that handler calls into the driver and
+updates PSP before exception return. The PendSV and SysTick vectors point to
+`0x60107f55` and `0x60107f59`, respectively, both self-branching infinite
+loops in the supplied firmware image. The emulator now models SVC entry,
+basic Cortex-M stack frames, EXC_RETURN, and non-nested enabled/pending
+external NVIC IRQ dispatch through VTOR. It models NVIC set/clear and priority
+state and honors PRIMASK/BASEPRI when taking pending interrupts. It does not
+invent a SysTick tick or assert an IRQ from the input-scan block: the current
+ready-group stall is therefore not claimed fixed until a real wake-up source
+is identified and connected.
+
+Ghidra shows
+`FUN_600ad690` configuring external IRQs 8, 9, and 26 (vector offsets
+`0x60`, `0x64`, and `0xa8`) with handlers that inspect `0x40010010` and
+`0x40010020`. That setup is also called from `FUN_600b1608` while updating
+device state, suggesting a USB/transfer path; no connection to the keyboard
+scan controller has been established. The handlers call the task-resume helper
+with event IDs 1, 4, 0x10, and 0x20 in their transfer/status paths, so they are
+real task wake-up paths when their peripheral source asserts; the source state
+and interrupt assertion behavior remain unmodeled. Do not connect the
+input-scan controller to these IRQs without additional evidence.
+
+A 10-million-instruction debugger run reaches `0x01006588` after
+`FUN_600a0a18` calls `FUN_600bf2c8`/`FUN_600cd420` and then waits on event 4.
+At a breakpoint immediately before the dispatcher loop, a fresh run showed
+`0xff` at `0x0101732c`, `1` at `0x0101732d`, and `0` at `0x01017330`; an earlier
+capture had zero at both `0x0101732d` and `0x01017330`. The run still remains
+in the dispatcher scan loop, so the ready-state bytes need further
+interpretation rather than assuming the group byte is always zero.
+
+Tracing the specific call shows that `FUN_600a0a18(1)` selects the firmware
+volume named `FMD000` from a table that also contains `RAM000`. Its request
+passes through `FUN_600cd728` and `FUN_600cd420`, which dispatches a driver
+callback. At the callback call site (`0x600cd444`), the function pointer is
+`0x600fd46f`; the Thumb code at `0x600fd46e` is `movs r0, #0; bx lr`, so this
+callback returns success without performing visible device I/O. The caller
+then executes `FUN_6009f3de(1, 1)`, which invokes
+`thunk_EXT_FUN_01006a9a(4)`. Thus the event-4 wait follows an `FMD000` driver
+dispatch, but the resolved callback does not establish that this operation
+starts a transfer or needs IRQ 9. A debugger run reaches the dispatcher
+without accessing `0x40010000`; no controller status or completion request is
+observed on this path.
+
+The service manual's printed page 55 boot-flow chart (PDF page 21) says
+interrupts are unmasked after backup-data and PCM initialization, then
+documents LCD ENB/RS refresh timing after interrupt exit. It does not identify
+the IRQ number or its source. The overall circuit diagram (PDF page 36,
+printed circuit page 1) shows SWX03 connected to the USB host/device ports and
+external flash ROM, but does not map internal SWX03 peripheral addresses or
+interrupt lines. This board-level evidence cannot tie the `0x40010000`
+controller to either USB or flash.
+
+The transfer controller is not included in the runtime memory map in
+`src/cpu.rs`, and `pend_interrupt` in `src/armv7.rs` has no runtime caller
+(only the focused IRQ test calls it). Although `FUN_600ad690` configures IRQs
+8, 9, and 26, the emulator currently has no identified device behavior to
+assert them. The PendSV and SysTick vectors are self-loops, so they do not
+provide a fallback scheduler tick. Do not force the ready bitmap or synthesize
+IRQ 9 until the event-4 wait's producer and the required peripheral status
+behavior are verified.
 
 The refreshed SVG includes an eight-character dot-matrix area (`Chars`, with
 `Char1`–`Char8`). The supplied controller identification is ML9040A-B01GA.
@@ -185,11 +304,11 @@ by the diagnostic report is based at `0x40000100`; the known low port-A
 register is `0x40000104`, and the scan interface pointer is `0x40000112`.
 
 `src/cpu.rs` models these identified addresses for diagnostic register reads
-and writes and logs the known LCD/DAC pin transitions. These operations update
-local state only. No firmware or ROM is loaded or executed, and no MMIO access
-is forwarded to physical hardware. The wider peripheral map, exact switch
-matrix pins, and scan-register semantics remain to be traced before building
-an executing machine model.
+and writes and logs the known LCD/DAC pin transitions. The live emulator runs
+firmware and updates local virtual peripheral state only; no MMIO access is
+forwarded to physical hardware. The wider peripheral map, exact switch matrix
+pins, and remaining scan-register semantics remain to be traced before
+building a more complete machine model.
 
 The firmware does expose individual display bits in software:
 
@@ -199,6 +318,14 @@ The firmware does expose individual display bits in software:
 - `flush_display_buffer_differences` at `0x6009944e` compares 64 output bytes against a previous-state copy and sends only changed bytes. For each changed byte it issues an address command (`index | 0x40`) and data (`byte | 0x4000`) through `thunk_EXT_FUN_0100b206`.
 - `update_display_text_if_changed` at `0x600a4880` separately updates up to eight text characters using address commands (`index | 0x80`) and character data (`char | 0x4000`). This is a separate text path from the 64-byte display/segment buffer.
 - `initialise_yamaha_display_interface` at `0x600a475a` sends controller setup commands, initializes eight character bytes, clears 64 controller entries, and initializes eight additional display registers. The exact controller command protocol and the physical LCD glass mapping still need validation against the IC601 datasheet or captures.
+
+Every emulated LCD ENB rising edge is now surfaced as a raw `LcdBusWrite`
+event (`RS` plus the byte on PA3–PA10), in addition to any decoded text update.
+This deliberately includes instruction/data bytes the ML9040A model or SVG
+segment map does not yet understand. The live UI logs these transactions; the
+terminal firmware debugger prints them as `[LCD] bus write ...`. This preserves
+the evidence for unknown/custom display writes instead of silently dropping
+them, without claiming an unverified physical segment mapping.
 
 ### LCD GPIO and live diagnostic-shell observations (2026-10-17)
 
@@ -260,4 +387,3 @@ Keep host file access sandboxed to a configured virtual drive. Firmware APIs and
 - **Confirmed from the service manual:** SWX03/MB8AA4640 main CPU/peripheral IC; external 256Mbit PROG/WAVE ROM, 128Mbit flash, 64Mbit SDRAM; 24-bit PCM1803A ADC and AK4430 DAC; YDA176 digital amp; USB1.1 full-speed host/device; 61-key/panel matrix, LCD, clocks, and documented startup order.
 - **Likely:** internal instrument/backup data and external USB storage matter to a full-featured machine.
 - **Unverified:** physical chip models, exact memory map, clocks, peripheral register layouts, audio-generation algorithm, boot chain, and whether the binaries are complete dumps.
-

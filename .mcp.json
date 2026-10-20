@@ -1,0 +1,16 @@
+{
+	"mcpServers": {
+		"GhidraMCP": {
+			"type": "stdio",
+			"command": "bridge-mcp-ghidra",
+			"args": []
+		},
+		"PSRShell": {
+			"type": "stdio",
+			"command": "/home/ziqian/Documents/PSR-E463_Emu_Project/.venv/bin/python",
+			"args": [
+				"/home/ziqian/Documents/PSR-E463_Emu_Project/psr_shell_mcp.py"
+			]
+		}
+	}
+}

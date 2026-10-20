@@ -73,6 +73,7 @@ pub enum PanelOutput {
     LcdSegment { svg_id: String, lit: bool },
     LcdSegmentsUpdated { segments: Vec<LcdSegmentState> },
     LcdText { text: String },
+    LcdBusWrite { register_select: bool, value: u8 },
 }
 
 /// Machine-facing boundary for panel input and core-driven display output.
@@ -151,6 +152,7 @@ pub struct PanelDisplayState {
     pub lit_leds: BTreeSet<String>,
     pub lit_lcd_segments: BTreeSet<String>,
     pub lcd_text: String,
+    pub last_lcd_bus_write: Option<(bool, u8)>,
 }
 
 impl PanelDisplayState {
@@ -166,6 +168,10 @@ impl PanelDisplayState {
                 }
             }
             PanelOutput::LcdText { text } => self.lcd_text = text,
+            PanelOutput::LcdBusWrite {
+                register_select,
+                value,
+            } => self.last_lcd_bus_write = Some((register_select, value)),
         }
     }
 }

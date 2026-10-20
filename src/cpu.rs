@@ -1,7 +1,7 @@
 //! Panel I/O bridge and bounded firmware execution for the native UI.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{self, BufRead, Write},
@@ -28,6 +28,13 @@ pub const SWX03_CORE_CLOCK_HZ: u32 = 135_475_200;
 const FIRMWARE_BASE: u32 = 0x6000_0000;
 const DRIVER_BASE: u32 = 0x0100_0000;
 const INSTRUCTIONS_PER_TICK: usize = 25_000;
+const SYSTEM_TIMER_COUNTER: u32 = 0x4000_0018;
+const INSTRUCTIONS_PER_TIMER_TICK: usize = 1_024;
+const SECONDARY_ENGINE_CONTROL: u32 = 0x4003_0000;
+const SECONDARY_ENGINE_START_BIT: u32 = 1 << 2;
+const INPUT_SCAN_CHANNEL_COUNT: usize = 16;
+const INPUTS_PER_SCAN_CHANNEL: usize = 6;
+const TEST_MODE_KEY_IDS: [u8; 3] = [15, 19, 22];
 
 /// Event-level stand-in for the SWX03 CPU while firmware loading/execution is
 /// intentionally disabled. Inputs are logged and forwarded as JSON lines;
@@ -44,17 +51,52 @@ pub struct CpuEmulator<W: Write> {
     firmware: Option<FirmwareRuntime>,
 }
 
+#[test]
+fn service_test_chord_maps_to_ghidra_scan_ids() {
+    let samples = test_chord_scan_samples();
+
+    assert_eq!(samples[2], 1 << 2);
+    assert_eq!(samples[3], (1 << 0) | (1 << 3));
+    assert_eq!(samples.iter().map(|sample| sample.count_ones()).sum::<u32>(), 3);
+}
+
+#[test]
+fn input_scan_completion_writes_samples_then_clears_request() {
+    let mut core = ArmV7Core::new().unwrap();
+    core.map_region(0x4000_0000, 0x1000, Prot::ALL).unwrap();
+    core.load_bytes(INPUT_SCAN_REGISTER, &0x8000_u16.to_le_bytes())
+        .unwrap();
+
+    assert!(complete_input_scan(&mut core, true).unwrap());
+
+    let mut request = [0; 2];
+    core.read_bytes(INPUT_SCAN_REGISTER, &mut request).unwrap();
+    assert_eq!(u16::from_le_bytes(request), 0);
+    let mut sample = [0; 2];
+    core.read_bytes(INPUT_SCAN_REGISTER + 2 + 2 * 2, &mut sample)
+        .unwrap();
+    assert_eq!(u16::from_le_bytes(sample), 1 << 2);
+    core.read_bytes(INPUT_SCAN_REGISTER + 2 + 3 * 2, &mut sample)
+        .unwrap();
+    assert_eq!(u16::from_le_bytes(sample), (1 << 0) | (1 << 3));
+}
+
 struct FirmwareRuntime {
     core: ArmV7Core,
     pc: u32,
     gpio_writes: Rc<RefCell<Vec<(u32, usize, i64)>>>,
+    lcd_port_a_low: u16,
     trace: Rc<RefCell<VecDeque<u32>>>,
     breakpoints: Rc<RefCell<HashSet<u32>>>,
     breakpoint_hit: Rc<RefCell<Option<u32>>>,
     watch_hit: Rc<RefCell<Option<String>>>,
     fault: Rc<RefCell<Option<(u32, usize, i64, u32, String)>>>,
+    timer_error: Rc<RefCell<Option<String>>>,
     audio: Rc<RefCell<crate::audio::VirtualAudioOutputs>>,
     usb: Rc<RefCell<crate::usb::VirtualUsb>>,
+    force_test_chord: bool,
+    test_mode_seen: bool,
+    test_lcd: Ml9040a,
     root: PathBuf,
     stopped: bool,
 }
@@ -86,14 +128,18 @@ impl<W: Write> CpuEmulator<W> {
         writer: W,
         outputs: Receiver<PanelOutput>,
         root: &Path,
+        force_test_mode: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut bridge = Self::new(writer, outputs);
-        bridge.firmware = Some(FirmwareRuntime::load(root)?);
+        bridge.firmware = Some(FirmwareRuntime::load(root, force_test_mode)?);
         Ok(bridge)
     }
 
     pub fn set_character_rom(&mut self, rom: CharacterRom) {
-        self.lcd = Ml9040a::with_character_rom(rom);
+        self.lcd = Ml9040a::with_character_rom(rom.clone());
+        if let Some(runtime) = self.firmware.as_mut() {
+            runtime.test_lcd = Ml9040a::with_character_rom(rom);
+        }
     }
 
     /// Read one modeled 16-bit SWX03 I/O register. Unmodeled reads are logged
@@ -143,6 +189,12 @@ impl<W: Write> CpuEmulator<W> {
         self.write16(PORT_A_LOW, port);
         self.write16(PORT_A_LOW, port | (1 << 12));
         self.write16(PORT_A_LOW, port);
+        let bus_write = PanelOutput::LcdBusWrite {
+            register_select: word & 0x4000 != 0,
+            value: word as u8,
+        };
+        self.log_output(&bus_write);
+        self.pending_outputs.push(bus_write);
         if let Some(output) = self.lcd.write(word & 0x4000 != 0, word as u8) {
             self.log_output(&output);
             self.pending_outputs.push(output);
@@ -190,6 +242,13 @@ impl<W: Write> CpuEmulator<W> {
                 self.log(format!("panel output LCD segments [{}]", states));
             }
             PanelOutput::LcdText { text } => self.log(format!("panel output LCD text {text:?}")),
+            PanelOutput::LcdBusWrite {
+                register_select,
+                value,
+            } => self.log(format!(
+                "panel output LCD bus RS={} value={value:#04x}",
+                u8::from(*register_select)
+            )),
         }
     }
 }
@@ -250,52 +309,134 @@ impl<W: Write> PanelIo for CpuEmulator<W> {
     }
 
     fn tick(&mut self) {
-        let Some(runtime) = self.firmware.as_mut() else { return };
-        if runtime.stopped { return; }
-        match runtime.core.run(runtime.pc, INSTRUCTIONS_PER_TICK) {
-            Ok(pc) => runtime.pc = pc | 1,
-            Err(error) => {
-                let pc = runtime.core.register(RegisterARM::PC).unwrap_or_default() as u32;
-                eprintln!("[CPU] firmware stopped at {pc:#010x}: {error}");
-                eprintln!("[AUDIO] {}", runtime.audio.borrow().summary());
-                eprintln!("[USB] {}", runtime.usb.borrow().summary());
+        let transactions = {
+            let Some(runtime) = self.firmware.as_mut() else { return };
+            if runtime.stopped { return; }
+            match runtime.core.run(runtime.pc, INSTRUCTIONS_PER_TICK) {
+                Ok(pc) => runtime.pc = pc | 1,
+                Err(error) => {
+                    let pc = runtime.core.register(RegisterARM::PC).unwrap_or_default() as u32;
+                    eprintln!("[CPU] firmware stopped at {pc:#010x}: {error}");
+                    eprintln!("[AUDIO] {}", runtime.audio.borrow().summary());
+                    eprintln!("[USB] {}", runtime.usb.borrow().summary());
+                    if let Err(dump_error) = runtime.write_core_dump() {
+                        eprintln!("[CPU] failed to write firmware core dump: {dump_error}");
+                    }
+                    runtime.stopped = true;
+                }
+            }
+            if let Some(error) = runtime.timer_error.borrow_mut().take() {
+                eprintln!("[TIMER] failed to update virtual counter: {error}");
                 if let Err(dump_error) = runtime.write_core_dump() {
                     eprintln!("[CPU] failed to write firmware core dump: {dump_error}");
                 }
                 runtime.stopped = true;
             }
-        }
-        // The scan block sets bit 15 when a scan starts. Until the matrix
-        // channel/bit wiring is verified, complete each request with all
-        // contacts open (zero samples) rather than inventing switch positions.
-        let mut scan_status = [0u8; 2];
-        if runtime.core.read_bytes(INPUT_SCAN_REGISTER, &mut scan_status).is_ok() {
-            let status = u16::from_le_bytes(scan_status);
-            if status & 0x8000 != 0 {
-                let idle = (status & !0x8000).to_le_bytes();
-                let _ = runtime.core.load_bytes(INPUT_SCAN_REGISTER, &idle);
+            let test_chord_pressed = runtime.force_test_chord && !runtime.test_mode_seen;
+            if let Err(error) = complete_input_scan(&mut runtime.core, test_chord_pressed) {
+                eprintln!("[INPUT] failed to complete input scan: {error}");
+                runtime.stopped = true;
             }
-        }
-        let writes = std::mem::take(&mut *runtime.gpio_writes.borrow_mut());
-        for (address, size, value) in writes {
-            if address != PORT_A_LOW || !(1..=2).contains(&size) { continue; }
-            let old = self.registers.get(&PORT_A_LOW).copied().unwrap_or_default();
-            let new = value as u16;
-            self.registers.insert(PORT_A_LOW, new);
-            if old & (1 << 12) == 0 && new & (1 << 12) != 0 {
-                let rs = new & (1 << 11) != 0;
-                let byte = ((new >> 3) & 0xff) as u8;
-                if let Some(output) = self.lcd.write(rs, byte) {
-                    self.log_output(&output);
-                    self.pending_outputs.push(output);
-                }
+            let writes = std::mem::take(&mut *runtime.gpio_writes.borrow_mut());
+            let transactions =
+                lcd_transactions_from_gpio_writes(&mut runtime.lcd_port_a_low, &writes);
+            for &(register_select, value) in &transactions {
+                runtime.observe_test_lcd_write(register_select, value);
+            }
+            transactions
+        };
+        for (register_select, value) in transactions {
+            let bus_write = PanelOutput::LcdBusWrite {
+                register_select,
+                value,
+            };
+            self.log_output(&bus_write);
+            self.pending_outputs.push(bus_write);
+            if let Some(output) = self.lcd.write(register_select, value) {
+                self.log_output(&output);
+                self.pending_outputs.push(output);
             }
         }
     }
 }
 
+/// Add deterministic startup-device behavior shared by the UI and test runners.
+pub fn attach_virtual_startup_model(
+    core: &mut ArmV7Core,
+) -> Result<Rc<RefCell<Option<String>>>, Box<dyn std::error::Error>> {
+    const PAGE: usize = 0x1000;
+
+    core.map_region(SECONDARY_ENGINE_CONTROL, PAGE, Prot::ALL)?;
+    core.map_region(0x4003_8000, 0x8000, Prot::ALL)?;
+
+    let timer_counter = Rc::new(Cell::new(0_u16));
+    let engine_start_pending = Rc::new(Cell::new(false));
+    let timer_error = Rc::new(RefCell::new(None));
+    let hook_engine_start_pending = Rc::clone(&engine_start_pending);
+    core.engine_mut().add_mem_hook(
+        HookType::MEM_WRITE,
+        u64::from(SECONDARY_ENGINE_CONTROL),
+        u64::from(SECONDARY_ENGINE_CONTROL),
+        move |_, _, _, _, value| {
+            if value as u32 & SECONDARY_ENGINE_START_BIT != 0 {
+                hook_engine_start_pending.set(true);
+            }
+            false
+        },
+    )?;
+
+    let hook_timer_counter = Rc::clone(&timer_counter);
+    let hook_engine_start_pending = Rc::clone(&engine_start_pending);
+    let hook_timer_error = Rc::clone(&timer_error);
+    let mut instructions_since_timer_tick = 0;
+    core.engine_mut().add_code_hook(1, 0, move |engine, _, _| {
+        instructions_since_timer_tick += 1;
+        if instructions_since_timer_tick != INSTRUCTIONS_PER_TIMER_TICK {
+            return;
+        }
+        instructions_since_timer_tick = 0;
+
+        let next_counter = hook_timer_counter.get().wrapping_add(1);
+        hook_timer_counter.set(next_counter);
+        if let Err(error) =
+            engine.mem_write(u64::from(SYSTEM_TIMER_COUNTER), &next_counter.to_le_bytes())
+        {
+            *hook_timer_error.borrow_mut() = Some(error.to_string());
+            let _ = engine.emu_stop();
+            return;
+        }
+
+        // Firmware polls this request bit until the secondary engine clears it.
+        if hook_engine_start_pending.replace(false) {
+            let mut control_bytes = [0; 4];
+            if let Err(error) =
+                engine.mem_read(u64::from(SECONDARY_ENGINE_CONTROL), &mut control_bytes)
+            {
+                *hook_timer_error.borrow_mut() = Some(error.to_string());
+                let _ = engine.emu_stop();
+                return;
+            }
+            let control = u32::from_le_bytes(control_bytes) & !SECONDARY_ENGINE_START_BIT;
+            if let Err(error) =
+                engine.mem_write(u64::from(SECONDARY_ENGINE_CONTROL), &control.to_le_bytes())
+            {
+                *hook_timer_error.borrow_mut() = Some(error.to_string());
+                let _ = engine.emu_stop();
+            }
+        }
+    })?;
+
+    eprintln!(
+        "[CPU] virtual 16-bit timer advances every {INSTRUCTIONS_PER_TIMER_TICK} instructions; secondary-engine start request completes on a timer tick"
+    );
+    Ok(timer_error)
+}
+
 impl FirmwareRuntime {
-    fn load(root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    fn load(
+        root: &Path,
+        force_test_chord: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         const PAGE: usize = 0x1000;
         const RAM_SIZE: usize = 0x0013_4000;
         const SDRAM_SIZE: usize = 0x0020_0000;
@@ -324,6 +465,7 @@ impl FirmwareRuntime {
             core.load_bytes(address, &bytes)?;
             eprintln!("[CPU] loaded {} bytes from {filename} at {address:#010x}", bytes.len());
         }
+        let timer_error = attach_virtual_startup_model(&mut core)?;
         let gpio_writes = Rc::new(RefCell::new(Vec::new()));
         let hook_writes = Rc::clone(&gpio_writes);
         let trace = Rc::new(RefCell::new(VecDeque::with_capacity(64)));
@@ -359,7 +501,43 @@ impl FirmwareRuntime {
         crate::bitband::attach(&mut core, Rc::clone(&usb))?;
         eprintln!("[CPU] firmware running; SWX03 clock reference is {SWX03_CORE_CLOCK_HZ} Hz (not simulated; instruction engine is not cycle-accurate)");
         eprintln!("[AUDIO] dummy DAC (AK4430) and D.AMP (YDA176) sinks attached at 0x4000400c; selector bit 9 at 0x4000400e, set=SDO1/D.AMP");
-        Ok(Self { core, pc: FIRMWARE_BASE | 1, gpio_writes, trace, breakpoints, breakpoint_hit, watch_hit, fault, audio, usb, root: root.to_path_buf(), stopped: false })
+        if force_test_chord {
+            eprintln!(
+                "[INPUT] injecting startup chord C#2/F2/G#2 scan samples until LCD TEST; scheduler/interrupt progress is not guaranteed"
+            );
+        }
+        Ok(Self {
+            core,
+            pc: FIRMWARE_BASE | 1,
+            gpio_writes,
+            lcd_port_a_low: 0,
+            trace,
+            breakpoints,
+            breakpoint_hit,
+            watch_hit,
+            fault,
+            timer_error,
+            audio,
+            usb,
+            force_test_chord,
+            test_mode_seen: false,
+            test_lcd: Ml9040a::default(),
+            root: root.to_path_buf(),
+            stopped: false,
+        })
+    }
+
+    fn observe_test_lcd_write(&mut self, register_select: bool, value: u8) {
+        if !self.force_test_chord || self.test_mode_seen {
+            return;
+        }
+        let Some(PanelOutput::LcdText { text }) = self.test_lcd.write(register_select, value) else {
+            return;
+        };
+        if text.to_ascii_uppercase().contains("TEST") {
+            self.test_mode_seen = true;
+            eprintln!("[INPUT] LCD displays TEST; releasing the startup chord");
+        }
     }
 
     fn add_watchpoint(&mut self, address: u32, length: usize, read: bool, write: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -429,13 +607,20 @@ impl FirmwareRuntime {
 
 /// Run the firmware in a terminal debugger. This shares the same memory and
 /// peripheral setup as the UI runtime, and never connects to physical hardware.
-pub fn run_firmware_debugger(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut runtime = FirmwareRuntime::load(root)?;
+pub fn run_firmware_debugger(
+    root: &Path,
+    force_test_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut runtime = FirmwareRuntime::load(root, force_test_mode)?;
     println!("Firmware debugger ready at {:#010x}. Type 'help' for commands.", runtime.pc & !1);
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut line = String::new();
     loop {
+        if runtime.stopped {
+            println!("firmware debugger stopped after virtual peripheral model error");
+            break;
+        }
         print!("psr> ");
         io::stdout().flush()?;
         line.clear();
@@ -511,12 +696,95 @@ pub fn run_firmware_debugger(root: &Path) -> Result<(), Box<dyn std::error::Erro
                 }
                 if let Some(address) = runtime.breakpoint_hit.borrow_mut().take() { println!("stopped at breakpoint {address:#010x}"); }
                 if let Some(event) = runtime.watch_hit.borrow_mut().take() { println!("watchpoint: {event}"); }
+                let test_chord_pressed = runtime.force_test_chord && !runtime.test_mode_seen;
+                if let Err(error) =
+                    complete_input_scan(&mut runtime.core, test_chord_pressed)
+                {
+                    eprintln!("[INPUT] failed to complete input scan: {error}");
+                    runtime.stopped = true;
+                }
+                let writes = std::mem::take(&mut *runtime.gpio_writes.borrow_mut());
+                for (register_select, value) in
+                    lcd_transactions_from_gpio_writes(&mut runtime.lcd_port_a_low, &writes)
+                {
+                    runtime.observe_test_lcd_write(register_select, value);
+                    let register = if register_select { "data" } else { "instruction" };
+                    println!("[LCD] bus write RS={register} value={value:#04x}");
+                }
                 println!("PC={:#010x}", runtime.pc & !1);
+                if let Some(error) = runtime.timer_error.borrow_mut().take() {
+                    eprintln!("[TIMER] failed to update virtual counter: {error}");
+                    runtime.stopped = true;
+                }
+
             }
             _ => println!("unknown command '{command}'; type 'help'"),
         }
     }
     Ok(())
+}
+
+fn complete_input_scan(
+    core: &mut ArmV7Core,
+    test_chord_pressed: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut status_bytes = [0; 2];
+    core.read_bytes(INPUT_SCAN_REGISTER, &mut status_bytes)?;
+    let status = u16::from_le_bytes(status_bytes);
+    if status & 0x8000 == 0 {
+        return Ok(false);
+    }
+
+    let samples = if test_chord_pressed {
+        test_chord_scan_samples()
+    } else {
+        [0; INPUT_SCAN_CHANNEL_COUNT]
+    };
+    let mut sample_bytes = [0; INPUT_SCAN_CHANNEL_COUNT * 2];
+    for (chunk, sample) in sample_bytes.chunks_exact_mut(2).zip(samples) {
+        chunk.copy_from_slice(&sample.to_le_bytes());
+    }
+    core.load_bytes(INPUT_SCAN_REGISTER + 2, &sample_bytes)?;
+    core.load_bytes(INPUT_SCAN_REGISTER, &(status & !0x8000).to_le_bytes())?;
+    Ok(true)
+}
+
+fn test_chord_scan_samples() -> [u16; INPUT_SCAN_CHANNEL_COUNT] {
+    let mut samples = [0; INPUT_SCAN_CHANNEL_COUNT];
+    for key_id in TEST_MODE_KEY_IDS {
+        let key_index = usize::from(key_id - 1);
+        let channel = key_index / INPUTS_PER_SCAN_CHANNEL;
+        let bit = key_index % INPUTS_PER_SCAN_CHANNEL;
+        samples[channel] |= 1_u16 << bit;
+    }
+    samples
+}
+
+fn lcd_transactions_from_gpio_writes(
+    port_a_low: &mut u16,
+    writes: &[(u32, usize, i64)],
+) -> Vec<(bool, u8)> {
+    let mut transactions = Vec::new();
+    for &(address, size, value) in writes {
+        let old = *port_a_low;
+        match (address, size) {
+            (PORT_A_LOW, 1) => {
+                *port_a_low = (old & 0xff00) | (value as u8 as u16);
+            }
+            (PORT_A_LOW, 2) => *port_a_low = value as u16,
+            (address, 1) if address == PORT_A_LOW + 1 => {
+                *port_a_low = (old & 0x00ff) | ((value as u8 as u16) << 8);
+            }
+            _ => continue,
+        }
+        if old & (1 << 12) == 0 && *port_a_low & (1 << 12) != 0 {
+            transactions.push((
+                *port_a_low & (1 << 11) != 0,
+                ((*port_a_low >> 3) & 0xff) as u8,
+            ));
+        }
+    }
+    transactions
 }
 
 fn parse_debug_address(value: &str) -> Option<u32> {
@@ -592,4 +860,72 @@ fn describe_pin_changes(address: u32, old: u16, new: u16) -> Vec<String> {
         ));
     }
     changes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_timer_completes_secondary_engine_start_request() {
+        let mut core = ArmV7Core::new().unwrap();
+        core.map_region(0x4000_0000, 0x1000, Prot::ALL).unwrap();
+        core.map_region(0x1000, 0x1000, Prot::ALL).unwrap();
+        attach_virtual_startup_model(&mut core).unwrap();
+
+        let mut code = Vec::new();
+        for instruction in [0x4801_u16, 0x2104, 0x6001, 0xe7fe] {
+            code.extend_from_slice(&instruction.to_le_bytes());
+        }
+        code.extend_from_slice(&SECONDARY_ENGINE_CONTROL.to_le_bytes());
+        core.load_bytes(0x1000, &code).unwrap();
+        core.run(0x1001, INSTRUCTIONS_PER_TIMER_TICK).unwrap();
+
+        let mut timer_bytes = [0; 2];
+        core.read_bytes(SYSTEM_TIMER_COUNTER, &mut timer_bytes)
+            .unwrap();
+        assert_eq!(u16::from_le_bytes(timer_bytes), 1);
+
+        let mut control_bytes = [0; 4];
+        core.read_bytes(SECONDARY_ENGINE_CONTROL, &mut control_bytes)
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(control_bytes) & SECONDARY_ENGINE_START_BIT,
+            0
+        );
+    }
+
+    #[test]
+    fn lcd_gpio_reports_every_enable_rising_edge() {
+        let mut port_a_low = 0;
+        let data_bus = (0x5a_u16 << 3) | (1 << 11);
+        let writes = [
+            (PORT_A_LOW, 2, i64::from(data_bus)),
+            (PORT_A_LOW, 2, i64::from(data_bus | (1 << 12))),
+            (PORT_A_LOW, 2, i64::from(data_bus | (1 << 12))),
+            (PORT_A_LOW, 2, i64::from(data_bus)),
+            (PORT_A_LOW, 2, i64::from(0x33)),
+            (PORT_A_LOW, 2, i64::from(0x33 | (1 << 12))),
+        ];
+
+        assert_eq!(
+            lcd_transactions_from_gpio_writes(&mut port_a_low, &writes),
+            [(true, 0x5a), (false, 0x06)]
+        );
+    }
+
+    #[test]
+    fn lcd_bus_output_preserves_unmapped_data_bytes() {
+        let (_, outputs) = std::sync::mpsc::channel();
+        let mut cpu = CpuEmulator::new(Vec::new(), outputs);
+        cpu.write_lcd_word(0x4000 | 0x19);
+
+        assert!(matches!(
+            cpu.poll_outputs().first(),
+            Some(PanelOutput::LcdBusWrite {
+                register_select: true,
+                value: 0x19
+            })
+        ));
+    }
 }

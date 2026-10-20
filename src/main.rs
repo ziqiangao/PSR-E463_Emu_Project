@@ -166,9 +166,10 @@ enum DragTarget {
 }
 
 fn main() -> glib::ExitCode {
+    let force_test_mode = env::args().any(|arg| arg == "--force-test-mode");
     if env::args().any(|arg| arg == "--debug-firmware") {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        return match psr_e463_ui::cpu::run_firmware_debugger(&root) {
+        return match psr_e463_ui::cpu::run_firmware_debugger(&root, force_test_mode) {
             Ok(()) => glib::ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("[CPU] firmware debugger failed: {error}");
@@ -177,6 +178,10 @@ fn main() -> glib::ExitCode {
         };
     }
     if let Some(instruction_limit) = parse_firmware_test_arg() {
+        if force_test_mode {
+            eprintln!("--force-test-mode is available with the live UI or debugger, not --test-firmware");
+            return glib::ExitCode::FAILURE;
+        }
         return match run_firmware_test(instruction_limit) {
             Ok(()) => glib::ExitCode::SUCCESS,
             Err(error) => {
@@ -326,6 +331,7 @@ fn main() -> glib::ExitCode {
             std::io::stdout(),
             output_rx,
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).as_path(),
+            force_test_mode,
         )
         .expect("load firmware for the UI emulator");
     cpu_io.set_character_rom(driver_character_rom.clone());
@@ -783,7 +789,7 @@ fn parse_firmware_test_arg() -> Option<usize> {
             return Some(limit.parse().unwrap_or(100_000));
         }
         if arg == "--help" || arg == "-h" {
-            println!("Usage: psr-e463-ui [--test-display [TEXT]] [--test-firmware [INSTRUCTIONS]] [--debug-firmware]");
+            println!("Usage: psr-e463-ui [--test-display [TEXT]] [--test-firmware [INSTRUCTIONS]] [--debug-firmware] [--force-test-mode]");
             std::process::exit(0);
         }
     }
@@ -869,6 +875,7 @@ fn run_firmware_test(instruction_limit: usize) -> Result<(), Box<dyn std::error:
     core.map_region(CORTEX_M_SCS_BASE, PAGE, Prot::ALL)?;
     let usb = psr_e463_ui::usb::attach(core.engine_mut())?;
     psr_e463_ui::bitband::attach(&mut core, usb)?;
+    let virtual_device_error = psr_e463_ui::cpu::attach_virtual_startup_model(&mut core)?;
     psr_e463_ui::flash::attach(&mut core, &root.join("flash.bin"))?;
     // The real reset/boot chain establishes banked stacks before entering the
     // image. This direct entry test uses the top of the mapped low RAM.
@@ -912,6 +919,10 @@ fn run_firmware_test(instruction_limit: usize) -> Result<(), Box<dyn std::error:
             eprintln!("[CPU] firmware test stopped at PC={pc:#010x}: {error}");
         }
     }
+    let virtual_device_error = virtual_device_error.borrow_mut().take();
+    if let Some(error) = &virtual_device_error {
+        eprintln!("[CPU] virtual startup model failed: {error}");
+    }
     let registers = [
         ("r0", RegisterARM::R0),
         ("r1", RegisterARM::R1),
@@ -933,6 +944,9 @@ fn run_firmware_test(instruction_limit: usize) -> Result<(), Box<dyn std::error:
     ];
     let mut dump = Vec::new();
     writeln!(dump, "PSR-E463 Unicorn core dump\n")?;
+    if let Some(error) = virtual_device_error {
+        writeln!(dump, "virtual startup model error: {error}\n")?;
+    }
     if let Some((address, size, value, pc)) = fault.get() {
         writeln!(
             dump,

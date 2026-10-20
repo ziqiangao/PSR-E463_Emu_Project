@@ -19,6 +19,18 @@ core backed by Unicorn Engine. Normal UI startup loads both supplied firmware
 images and runs the main image in 25,000-instruction slices on the GTK timer.
 This is an instruction budget, not cycle-accurate timing. The 20 ms UI cadence
 does not imply that the guest ran at its hardware clock rate.
+The live UI, debugger, and smoke-test firmware runtimes model the observed
+16-bit counter at `0x40000018` as a free-running virtual timer, advancing it
+once per 1,024 guest instructions. This deterministic approximation allows
+timer polling loops to progress; it is not a cycle-accurate model of the SWX03
+timer or its prescaler. The secondary-engine startup path also uses zero-backed
+control registers at `0x40030000` and a `0x8000`-byte RAM/configuration window
+at `0x40038000`; the observed start-request bit completes on the next virtual
+timer tick. These are minimal firmware-progress stand-ins, not hardware models.
+Other zero-backed startup pages are documented with their Ghidra evidence and
+confidence in [NOTES_EMULATOR_REQUIREMENTS.md](NOTES_EMULATOR_REQUIREMENTS.md);
+the service manual's block diagrams do not provide an internal SWX03 register
+map.
 
 Run an opt-in firmware smoke test with `cargo run -- --test-firmware` or set a
 different instruction budget with `cargo run -- --test-firmware 1000000`. The
@@ -33,6 +45,25 @@ execution. Candidate read-only PSR shell `d` inspections for these addresses
 are listed in [PSR_SHELL_ADDRESS_SAFETY.md](PSR_SHELL_ADDRESS_SAFETY.md). The
 The live UI and smoke test currently use separate machine setup paths so the
 smoke test remains useful for diagnosing startup faults.
+
+To simulate the service-manual startup chord, run
+`cargo run -- --force-test-mode`. The emulator holds C#2, F2, and G#2 in the
+firmware input-scan samples until its modeled LCD displays `TEST`, then releases
+them. The same option works with `--debug-firmware`. This is opt-in and does
+not modify the firmware image or persistent flash. It currently injects scan
+samples only; it does not yet guarantee test-mode entry because the scheduler
+still stalls at `0x01006588` waiting for an event source that has not yet been
+identified. The emulator now handles Cortex-M SVC and enabled/pending NVIC
+exceptions through the firmware vector table, but does not synthesize a
+keyboard or timer interrupt without evidence for its hardware source.
+A debugger trace also shows the boot-time event-4 wait without any access to
+the `0x40010000` controller; its known IRQ 9 setup is reached from USB state
+handling, so the emulator does not assert that IRQ as a speculative wakeup.
+The wait follows a request for the firmware volume `FMD000`, but Ghidra's
+resolved driver callback is only a two-instruction success stub and does not
+show that the request starts a transfer. The service manual documents when
+interrupts are unmasked and shows SWX03's USB and flash connections, but does
+not identify the internal IRQ source or map it to `0x40010000`.
 
 Start the interactive terminal debugger with `cargo run -- --debug-firmware`.
 It uses the same firmware and virtual peripheral setup as the UI, but waits at
@@ -60,10 +91,12 @@ the prompt.
 The live UI connects firmware writes on PA3–PA10, PA11 (RS), and PA12 (ENB) to
 the ML9040A-B01GA model and uses `ui/character_rom.json` for its configurable
 glyphs. The confirmed input-scan controller at `0x40000112` completes requests
-with all contacts open. Panel switches and piano contacts continue to be
-reported as symbolic input events because the firmware scan channel/bit matrix
-has not yet been established. Other startup peripheral pages are zero-backed
-stubs; LED and knob ADC behavior is not modeled. Audio transfer words reach
+with all contacts open by default. Ghidra maps the service chord to scan IDs
+15, 19, and 22 (channels 2/3, bits 2/0/3); `--force-test-mode` injects those
+samples at startup. The physical matrix wiring remains unresolved, so ordinary
+panel/piano inputs are still logged as symbolic events rather than connected to
+scan samples. Other startup peripheral pages are zero-backed stubs; LED and
+knob ADC behavior is not modeled. Audio transfer words reach
 dummy DAC and digital-amplifier sinks, with no sound output.
 
 The service manual identifies two separate USB connections: USB TO DEVICE is
@@ -175,13 +208,25 @@ aspect ratio.
 {"type":"lcd_text","text":"VOICE 001"}
 ```
 
-The output types are `led`, `lcd_segment`, `lcd_segments_updated`, and
-`lcd_text`; the input types are `switch`, `piano_contact`, `knob`, and
+The output types are `led`, `lcd_segment`, `lcd_segments_updated`, `lcd_text`,
+and `lcd_bus_write`; the input types are `switch`, `piano_contact`, `knob`, and
 `encoder_step`. LCD segment batches have this shape:
 
 ```json
 {"type":"lcd_segments_updated","segments":[{"svg_id":"A","lit":true},{"svg_id":"B","lit":false}]}
 ```
+
+Firmware LCD transactions are also emitted as raw bus events, including bytes
+that have no current text/segment interpretation:
+
+```json
+{"type":"lcd_bus_write","register_select":true,"value":65}
+```
+
+`register_select` is `false` for an instruction and `true` for data. The live
+firmware UI logs each detected ENB rising edge, and the terminal debugger
+prints the same raw RS/value pair. Decoding and SVG segment attribution remain
+incomplete; raw events are observable rather than silently discarded.
 
 `src/lcd.rs` exposes the `Ml9040a` controller model for the ML9040A-B01GA.
 Pass controller writes as `(register_select, byte)`: `false` selects the
@@ -195,11 +240,11 @@ byte)` for each emulated LCD bus transaction, then route any returned
 `PanelOutput` through the panel output channel (the GTK app reads newline-
 delimited output JSON from stdin). For example, send `{"type":"lcd_text",
 "text":"VOICE 001"}` to display text directly, or update mapped SVG segments
-with `lcd_segment` / `lcd_segments_updated`. The current standalone `CpuEmulator`
-only models its confirmed GPIO LCD word writes; firmware is not loaded or
-executed, so the character display will stay blank until a core writes to it
-or an output event is supplied. In the normal UI launch, both firmware images
-are loaded and executed, and GPIO LCD bus writes feed this driver.
+with `lcd_segment` / `lcd_segments_updated`. The GTK app's `CpuEmulator` loads
+and executes both firmware images. Each detected
+GPIO LCD bus transaction is exposed as `LcdBusWrite`; decoded character
+changes also update the display model. The external `JsonLinePanelIo` adapter
+does not execute firmware and only applies output events supplied by its host.
 
 Unknown or malformed input lines are ignored with a diagnostic on stderr. The
 `CpuEmulator` runs the firmware in-process and logs panel inputs. Its known LCD
