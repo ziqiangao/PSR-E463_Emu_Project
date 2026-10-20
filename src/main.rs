@@ -167,9 +167,19 @@ enum DragTarget {
 
 fn main() -> glib::ExitCode {
     let force_test_mode = env::args().any(|arg| arg == "--force-test-mode");
-    if env::args().any(|arg| arg == "--debug-firmware") {
+    let debug_firmware = env::args().any(|arg| arg == "--debug-firmware");
+    let diagnostic_wake_event4 = env::args().any(|arg| arg == "--diagnostic-wake-event4");
+    if diagnostic_wake_event4 && !debug_firmware {
+        eprintln!("--diagnostic-wake-event4 is available only with --debug-firmware");
+        return glib::ExitCode::FAILURE;
+    }
+    if debug_firmware {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        return match psr_e463_ui::cpu::run_firmware_debugger(&root, force_test_mode) {
+        return match psr_e463_ui::cpu::run_firmware_debugger(
+            &root,
+            force_test_mode,
+            diagnostic_wake_event4,
+        ) {
             Ok(()) => glib::ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("[CPU] firmware debugger failed: {error}");
@@ -789,7 +799,7 @@ fn parse_firmware_test_arg() -> Option<usize> {
             return Some(limit.parse().unwrap_or(100_000));
         }
         if arg == "--help" || arg == "-h" {
-            println!("Usage: psr-e463-ui [--test-display [TEXT]] [--test-firmware [INSTRUCTIONS]] [--debug-firmware] [--force-test-mode]");
+            println!("Usage: psr-e463-ui [--test-display [TEXT]] [--test-firmware [INSTRUCTIONS]] [--debug-firmware [--force-test-mode] [--diagnostic-wake-event4]]");
             std::process::exit(0);
         }
     }
@@ -1491,16 +1501,19 @@ fn draw(ctx: &Context, width: f64, height: f64, panel: &Panel) {
         panel.rotary_angle,
     );
 
-    for id in panel.pressed_switches.keys() {
-        if panel.shapes.iter().any(|shape| {
-            shape.id.as_deref() == Some(id)
-                && shape.groups.iter().any(|group| group == "LEDButtons")
-        }) {
-            fill_target_bounds(ctx, panel, id, (1.0, 0.33, 0.33, 0.75));
-        }
-    }
     for id in &panel.display.lit_leds {
-        fill_target_bounds(ctx, panel, id, (1.0, 0.33, 0.33, 0.9));
+        if let Some(targets) = led_artwork_targets(id) {
+            for target in targets {
+                let opacity = if matches!(*target, "Voice" | "Style-2" | "Song-2" | "Groove-2") {
+                    0.75
+                } else {
+                    0.9
+                };
+                fill_target_bounds(ctx, panel, target, (1.0, 0.33, 0.33, opacity));
+            }
+        } else {
+            fill_target_bounds(ctx, panel, id, (1.0, 0.33, 0.33, 0.9));
+        }
     }
     for id in &panel.display.lit_lcd_segments {
         fill_target_bounds(ctx, panel, id, (0.2, 0.2, 0.2, 1.0));
@@ -1533,6 +1546,16 @@ fn draw(ctx: &Context, width: f64, height: f64, panel: &Panel) {
     ctx.line_to(panel.width - 2.0, panel.height - 8.0);
     let _ = ctx.stroke();
     ctx.restore().ok();
+}
+
+fn led_artwork_targets(id: &str) -> Option<&'static [&'static str]> {
+    match id {
+        "Voice" => Some(&["Voice"]),
+        "Style" | "Style-2" => Some(&["Style", "Style-2"]),
+        "Song" | "Song-2" => Some(&["Song", "Song-2"]),
+        "Groove" | "Groove-2" => Some(&["Groove", "Groove-2"]),
+        _ => None,
+    }
 }
 
 fn draw_rotated_sprite(
@@ -1572,6 +1595,54 @@ fn fill_target_bounds(ctx: &Context, panel: &Panel, id: &str, color: (f64, f64, 
         ctx.set_source_rgba(color.0, color.1, color.2, color.3);
         ctx.rectangle(x, y, width, height);
         let _ = ctx.fill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_lcd_segment_ids, led_artwork_targets, Document};
+
+    #[test]
+    fn named_leds_drive_button_lights_and_indicator_artwork() {
+        assert_eq!(led_artwork_targets("Voice"), Some(&["Voice"][..]));
+        assert_eq!(led_artwork_targets("Style"), Some(&["Style", "Style-2"][..]));
+        assert_eq!(led_artwork_targets("Song"), Some(&["Song", "Song-2"][..]));
+        assert_eq!(led_artwork_targets("Groove"), Some(&["Groove", "Groove-2"][..]));
+    }
+
+    #[test]
+    fn unknown_led_names_keep_the_generic_artwork_fallback() {
+        assert_eq!(led_artwork_targets("unknown"), None);
+    }
+
+    #[test]
+    fn track_status_artwork_ids_are_included_in_lcd_segments() {
+        let document = Document::parse(include_str!("../PSR-E463.svg")).expect("parse panel SVG");
+        let root = document.root_element();
+        let tracks = root
+            .descendants()
+            .find(|node| node.attribute("id") == Some("Tracks"))
+            .expect("find track status group");
+        let track_ids = tracks
+            .children()
+            .filter(|node| node.tag_name().name() == "path")
+            .filter_map(|node| node.attribute("id"))
+            .collect::<Vec<_>>();
+        let expected = [
+            "LCDTrack1",
+            "LCDTrack2",
+            "LCDTrack3",
+            "LCDTrack4",
+            "LCDTrack5",
+            "LCDTrack6",
+            "LCDTrackA",
+        ];
+
+        assert_eq!(track_ids, expected);
+        let lcd_segment_ids = collect_lcd_segment_ids(root);
+        for id in expected {
+            assert!(lcd_segment_ids.iter().any(|segment_id| segment_id == id));
+        }
     }
 }
 

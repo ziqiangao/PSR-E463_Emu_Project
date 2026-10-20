@@ -327,6 +327,13 @@ impl ArmV7Core {
         self.interrupts.borrow_mut().pend_irq(irq)
     }
 
+    pub fn interrupt_pender(
+        &self,
+    ) -> impl Fn(u16) -> Result<(), &'static str> + 'static {
+        let interrupts = Rc::clone(&self.interrupts);
+        move |irq| interrupts.borrow_mut().pend_irq(irq)
+    }
+
     fn install_exception_hooks(&mut self) -> Result<(), uc_error> {
         let interrupts = Rc::clone(&self.interrupts);
         self.engine.add_mem_hook(

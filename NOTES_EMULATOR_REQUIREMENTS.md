@@ -38,7 +38,7 @@ An earlier `--test-firmware 10000000` run with the live UI's observed `0x4000100
 
 The flash window is implemented by `src/flash.rs` and backed by a 16 MiB `flash.bin` in the project root. A missing file is initialized to `0xff`, matching erased NOR state; shorter files are padded with `0xff`, and larger files are rejected without truncation. The model implements the firmware-observed x16 reset, autoselect, word-program sequences, sector/chip erase, and MX29GL128F CFI query values. Firmware-programmed words are constrained to NOR 1-to-0 transitions and persisted. The default file contains erased bytes, not captured factory parameter data.
 
-The service manual's boot-flow chart says a unit that boots but fails before the test-program decision is likely to have an SWX03 or DataFlash fault. The emulator can reach and display the “YAMAHA” opening indication, so that chart does not by itself prove the cause of a freeze after that point. However, Ghidra shows the firmware queries CFI during flash initialization: it checks `QRY`, then reads the erase-region count at offset `0x58` and region descriptors at `0x5a`–`0x60`. The previous emulator implementation returned zero for these fields, which contradicted the MX29GL128F datasheet (one region, 128 × 128 KiB sectors). `src/flash.rs` now returns the documented CFI fields, including the geometry and timing values read by the firmware. The mapped flash and backing file now cover the full 16 MiB chip capacity; the reported Yamaha-screen freeze still needs a fresh run to confirm whether the CFI correction resolves it. The default flash image contains erased bytes rather than captured factory parameter data.
+The service manual's boot-flow chart says a unit that boots but fails before the test-program decision is likely to have an SWX03 or DataFlash fault. The emulator can reach and display the “YAMAHA” opening indication, so that chart does not by itself prove the cause of a freeze after that point. However, Ghidra shows the firmware queries CFI during flash initialization: it checks `QRY`, then reads the erase-region count at offset `0x58` and region descriptors at `0x5a`–`0x60`. The previous emulator implementation returned zero for these fields, which contradicted the MX29GL128F datasheet (one region, 128 × 128 KiB sectors). `src/flash.rs` now returns the documented CFI fields, including the geometry and timing values read by the firmware. The mapped flash and backing file now cover the full 16 MiB chip capacity; a fresh debug run reaches later RTOS scheduling, so the CFI correction alone does not get the firmware to the normal main screen. The default flash image contains erased bytes rather than captured factory parameter data.
 
 The earlier smoke-test stop at `PC=0x0100178e` writing `0xf000` to `0x40002700` remains relevant when the `0x40002000` page is omitted; that page is an unknown startup stub, not an identified peripheral model. The `0x40005000` page is now reserved for the provisional disconnected USB model; startup stubs at `0x40000000`, `0x40004000`, `0x40008000`, `0x40009000`, `0x4000a000`, and `0xe000e000` remain zero-backed placeholders or currently unmapped. Ghidra's `0x68000000` block spans only `0x19420` bytes, smaller than the startup-clear descriptor, so the larger guest-RAM map is supported as a firmware startup target but its physical hardware extent is not independently confirmed. Read-only `d` inspections of these live addresses completed after reboot; raw results and interpretations are in [PSR_SHELL_ADDRESS_SAFETY.md](PSR_SHELL_ADDRESS_SAFETY.md). Do not infer shell write safety from these emulator mappings.
 
@@ -190,6 +190,38 @@ displays `TEST`; ordinary UI inputs remain symbolic until the physical matrix
 is resolved. The input-scan model has no verified IRQ source, so this override
 does not guarantee the firmware reaches the scan or test-mode path.
 
+The firmware's button test is implemented by `FUN_600b21ae` and
+`FUN_600b226c`, which both call `FUN_600b206c`. That helper displays the label
+at the current table index. The test table begins at `0x600f2ba0`; each
+8-byte entry contains a label pointer and the panel event code at offset 4.
+`FUN_600b226c` accepts panel events of type `0x0f`, checks the pressed-state
+bitmap, and compares the event code against the current entry. The other
+caller advances the expected entry after the corresponding test event. The
+table confirms the previously missing artwork IDs: `ACMP=0x30`,
+`Audio-2` (Audio) `=0x4d`, `DSP-2` (DSP) `=0x53`,
+`Function-2` (Function) `=0x1b`, `KnobAssign` (Assign) `=0x4f`,
+`MelodySupp` (MELODY) `=0x55`, `Rec` (REC) `=0x3d`, and `Target=0x50`.
+It also identifies Harmony as `0x54`, Transpose as `0x52`, Category Right as
+`0x0e`, and Category Left as `0x0f`, correcting the old `0x20`, `0x1b`, `0x0c`,
+and `0x0d` assignments respectively. The artwork's `Style-2` is a duplicate
+of `Style` and both use `0x13`.
+These are firmware button-test codes, not physical GPIO row/column pins.
+
+The four illuminated-button scan codes are Voice `0x12`, Style `0x13`, Groove
+`0x14`, and Song `0x18` (from the button test table). The SVG also has three
+separate indicator paths named `Style`, `Song`, and `Groove`; the illuminated
+button faces are `Voice`, `Style-2`, `Song-2`, and `Groove-2`. The UI now
+routes named LED outputs to both the separate indicator and corresponding
+button face where present, using its existing red light color. Pressing a
+button no longer fakes its light state.
+
+`FUN_600b2494` exercises GPIO output/input combinations at `0x40000100` during
+a diagnostic test, but the observed loop and table do not establish which
+output pins drive the four button lamps or the three indicator paths. The
+firmware-backed runtime currently does not emit these LED states; the UI
+responds to explicit `PanelOutput::Led` messages. Do not infer lamp wiring from
+the button scan codes or this GPIO test alone.
+
 `FUN_01006482` is the RTOS dispatcher/context-switch routine. It selects
 runnable tasks from the scheduler bitmaps, restores saved task contexts via
 SVC, and enters a busy loop when there are no ready groups. In that loop it
@@ -241,13 +273,45 @@ real task wake-up paths when their peripheral source asserts; the source state
 and interrupt assertion behavior remain unmodeled. Do not connect the
 input-scan controller to these IRQs without additional evidence.
 
-A 10-million-instruction debugger run reaches `0x01006588` after
+A 10-million-instruction debug run reaches `0x01006588` after
 `FUN_600a0a18` calls `FUN_600bf2c8`/`FUN_600cd420` and then waits on event 4.
-At a breakpoint immediately before the dispatcher loop, a fresh run showed
-`0xff` at `0x0101732c`, `1` at `0x0101732d`, and `0` at `0x01017330`; an earlier
-capture had zero at both `0x0101732d` and `0x01017330`. The run still remains
-in the dispatcher scan loop, so the ready-state bytes need further
-interpretation rather than assuming the group byte is always zero.
+The first breakpoint at `0x01006588` is the dispatcher's first ready-group
+poll, not by itself proof of a permanent stall: that snapshot showed `0xff` at
+`0x0101732c`, `1` at `0x0101732d`, and `0` at `0x01017330`. After removing the
+breakpoint and running 10 million more instructions, execution remained in
+the poll loop; the trace repeated through `0x01006588` and
+`enableIRQinterrupts(0)` at `0x010068a6`, and the final bytes were `0xff` at
+`0x0101732c`, `0` at `0x0101732d`, and `0` at `0x01017330`. This confirms that
+the later state has no ready task, while the one-time breakpoint at
+`0x01006588` is not sufficient to diagnose the freeze.
+
+### Rechecked Yamaha-screen stall and `AllMem` string (2026-10-20)
+
+The 16 MiB `flash.bin` was verified to contain only `0xff` before and after
+the debug runs. At `0x600c9a84`, `InitializeSecondaryEngine` captures the
+16-bit counter at `0x40000018`; the `0x600c9a8a` loop exits when the unsigned
+delta reaches `0x12c` (300 ticks). With the current virtual timer model, a
+breakpoint at `0x600c9a94` showed `r1 = 0x14c5`, `r2 = 0x12c`, and timer
+`0x40000018 = 0x15f1`; execution then passed the secondary-engine start wait
+at `0x600c9aa0`–`0x600c9aa4`. Thus the reported PC `0x600c9a8a` is no longer
+the current blocker in `--debug-firmware`; this timer model only advances the
+counter and completes that start request, it does not wake RTOS tasks.
+
+The later dispatcher run reached the no-ready-group loop described above.
+The debug trace logged flash reset/auto-select activity and the LCD's
+`Yamaha` opening text, but did not reach a runnable task that would advance
+startup. The service manual's boot-flow chart (PDF page 21, printed page 56)
+shows the normal opening indication `YAMAHA`, followed by the main screen
+`GrandPno`; it does not identify `AllMem` as the normal boot screen.
+
+The text `AllMem  ` is at `0x600e2aa8`; `0x600e3fcc` is a string-table pointer
+whose contents are `0x600e2aa8`, not the string itself. The adjacent 12-byte
+entries include `BlankCut`, `BackUp`, `Flash`, `Writing!`, `Error!`,
+`Can'tUse`, registration labels, `Mem Full`, and `ClrUser` labels. Ghidra's
+reference to `AllMem` terminates at this data pointer; no function reference
+to the string was found. Its use during erased-flash startup is therefore
+not yet established, and the string alone does not prove that boot should
+display it.
 
 Tracing the specific call shows that `FUN_600a0a18(1)` selects the firmware
 volume named `FMD000` from a table that also contains `RAM000`. Its request
@@ -271,14 +335,31 @@ external flash ROM, but does not map internal SWX03 peripheral addresses or
 interrupt lines. This board-level evidence cannot tie the `0x40010000`
 controller to either USB or flash.
 
-The transfer controller is not included in the runtime memory map in
-`src/cpu.rs`, and `pend_interrupt` in `src/armv7.rs` has no runtime caller
-(only the focused IRQ test calls it). Although `FUN_600ad690` configures IRQs
-8, 9, and 26, the emulator currently has no identified device behavior to
-assert them. The PendSV and SysTick vectors are self-loops, so they do not
-provide a fallback scheduler tick. Do not force the ready bitmap or synthesize
-IRQ 9 until the event-4 wait's producer and the required peripheral status
-behavior are verified.
+The runtime maps the `0x40010000` transfer-controller page and has a
+conditional stand-in that completes a request only after firmware sets the
+channel-1 start bit at `0x40010020`; it writes status code 5 and pends IRQ 9.
+The boot trace does not write that register, so this model does not wake the
+boot task. `FUN_600ad690` configures IRQs 8, 9, and 26, but that setup is not
+reached before the observed idle loop. The PendSV and SysTick vectors are
+self-loops and cannot provide a fallback scheduler tick.
+
+At the idle-loop snapshot, the event-table pointer at `0x01017534` is zero and
+the event-4 lookup in `FUN_01006a08` consequently finds no registered waiter.
+The boot task reaches the `FUN_600b7924` wrapper, which calls the driver wait
+API for event 4, then the dispatcher has no ready task. The resolved `FMD000`
+callback still returns success without visible I/O; neither it nor the trace
+identifies what should complete the wait. Do not treat the conditional
+transfer stand-in as the boot source or modify ready bitmaps to force progress.
+
+For downstream diagnosis only, `--debug-firmware --diagnostic-wake-event4`
+returns immediately from the first `FUN_600b7924` event-4 wait wrapper. This
+one-shot bypass does not signal an RTOS event or emulate a peripheral; its
+purpose is to determine whether later firmware initialization can reach
+`GrandPno` when this wait is skipped. The run returned from that wait to
+`0x600b7762` but then settled back in the dispatcher idle loop at
+`0x01006588`; the `GrandPno` LCD milestone was not reached and `flash.bin`
+remained fully erased. This confirms the single wait is not the only missing
+boot progression mechanism. Normal runtime behavior is unchanged.
 
 The refreshed SVG includes an eight-character dot-matrix area (`Chars`, with
 `Char1`–`Char8`). The supplied controller identification is ML9040A-B01GA.

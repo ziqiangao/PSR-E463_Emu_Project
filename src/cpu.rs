@@ -12,7 +12,7 @@ use std::{
 
 use unicorn_engine::{unicorn_const::{HookType, Prot}, RegisterARM};
 
-use crate::armv7::ArmV7Core;
+use crate::armv7::{ArmV7Core, CoreRunError};
 use crate::lcd::{CharacterRom, Ml9040a};
 use crate::{PanelInput, PanelIo, PanelOutput};
 
@@ -32,6 +32,12 @@ const SYSTEM_TIMER_COUNTER: u32 = 0x4000_0018;
 const INSTRUCTIONS_PER_TIMER_TICK: usize = 1_024;
 const SECONDARY_ENGINE_CONTROL: u32 = 0x4003_0000;
 const SECONDARY_ENGINE_START_BIT: u32 = 1 << 2;
+const TRANSFER_CHANNEL_1_CONTROL: u32 = 0x4001_0020;
+const TRANSFER_CHANNEL_1_STATUS: u32 = TRANSFER_CHANNEL_1_CONTROL + 4;
+const TRANSFER_CHANNEL_START_BIT: u32 = 1 << 31;
+const TRANSFER_COMPLETE_STATUS: u32 = 5 << 16;
+const TRANSFER_COMPLETE_IRQ: u16 = 9;
+const EVENT4_WAIT_WRAPPER: u32 = 0x600b_7924;
 const INPUT_SCAN_CHANNEL_COUNT: usize = 16;
 const INPUTS_PER_SCAN_CHANNEL: usize = 6;
 const TEST_MODE_KEY_IDS: [u8; 3] = [15, 19, 22];
@@ -92,10 +98,13 @@ struct FirmwareRuntime {
     watch_hit: Rc<RefCell<Option<String>>>,
     fault: Rc<RefCell<Option<(u32, usize, i64, u32, String)>>>,
     timer_error: Rc<RefCell<Option<String>>>,
+    diagnostic_event4_return: Rc<Cell<Option<u32>>>,
+    diagnostic_event4_error: Rc<RefCell<Option<String>>>,
     audio: Rc<RefCell<crate::audio::VirtualAudioOutputs>>,
     usb: Rc<RefCell<crate::usb::VirtualUsb>>,
     force_test_chord: bool,
     test_mode_seen: bool,
+    grand_pno_seen: bool,
     test_lcd: Ml9040a,
     root: PathBuf,
     stopped: bool,
@@ -131,7 +140,7 @@ impl<W: Write> CpuEmulator<W> {
         force_test_mode: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut bridge = Self::new(writer, outputs);
-        bridge.firmware = Some(FirmwareRuntime::load(root, force_test_mode)?);
+        bridge.firmware = Some(FirmwareRuntime::load(root, force_test_mode, false)?);
         Ok(bridge)
     }
 
@@ -312,8 +321,8 @@ impl<W: Write> PanelIo for CpuEmulator<W> {
         let transactions = {
             let Some(runtime) = self.firmware.as_mut() else { return };
             if runtime.stopped { return; }
-            match runtime.core.run(runtime.pc, INSTRUCTIONS_PER_TICK) {
-                Ok(pc) => runtime.pc = pc | 1,
+            match runtime.run_instructions(INSTRUCTIONS_PER_TICK) {
+                Ok(_) => {}
                 Err(error) => {
                     let pc = runtime.core.register(RegisterARM::PC).unwrap_or_default() as u32;
                     eprintln!("[CPU] firmware stopped at {pc:#010x}: {error}");
@@ -368,9 +377,11 @@ pub fn attach_virtual_startup_model(
 
     core.map_region(SECONDARY_ENGINE_CONTROL, PAGE, Prot::ALL)?;
     core.map_region(0x4003_8000, 0x8000, Prot::ALL)?;
+    core.map_region(TRANSFER_CHANNEL_1_CONTROL & !(PAGE as u32 - 1), PAGE, Prot::ALL)?;
 
     let timer_counter = Rc::new(Cell::new(0_u16));
     let engine_start_pending = Rc::new(Cell::new(false));
+    let transfer_pending = Rc::new(Cell::new(false));
     let timer_error = Rc::new(RefCell::new(None));
     let hook_engine_start_pending = Rc::clone(&engine_start_pending);
     core.engine_mut().add_mem_hook(
@@ -385,9 +396,24 @@ pub fn attach_virtual_startup_model(
         },
     )?;
 
+    let hook_transfer_pending = Rc::clone(&transfer_pending);
+    core.engine_mut().add_mem_hook(
+        HookType::MEM_WRITE,
+        u64::from(TRANSFER_CHANNEL_1_CONTROL),
+        u64::from(TRANSFER_CHANNEL_1_CONTROL),
+        move |_, _, _, _, value| {
+            if value as u32 & TRANSFER_CHANNEL_START_BIT != 0 {
+                hook_transfer_pending.set(true);
+            }
+            false
+        },
+    )?;
+
     let hook_timer_counter = Rc::clone(&timer_counter);
     let hook_engine_start_pending = Rc::clone(&engine_start_pending);
+    let hook_transfer_pending = Rc::clone(&transfer_pending);
     let hook_timer_error = Rc::clone(&timer_error);
+    let pend_interrupt = core.interrupt_pender();
     let mut instructions_since_timer_tick = 0;
     core.engine_mut().add_code_hook(1, 0, move |engine, _, _| {
         instructions_since_timer_tick += 1;
@@ -424,10 +450,34 @@ pub fn attach_virtual_startup_model(
                 let _ = engine.emu_stop();
             }
         }
+
+        if hook_transfer_pending.replace(false) {
+            let mut status_bytes = [0; 4];
+            if let Err(error) =
+                engine.mem_read(u64::from(TRANSFER_CHANNEL_1_STATUS), &mut status_bytes)
+            {
+                *hook_timer_error.borrow_mut() = Some(error.to_string());
+                let _ = engine.emu_stop();
+                return;
+            }
+            let status = u32::from_le_bytes(status_bytes) & !0x0007_0000;
+            let status = status | TRANSFER_COMPLETE_STATUS;
+            if let Err(error) =
+                engine.mem_write(u64::from(TRANSFER_CHANNEL_1_STATUS), &status.to_le_bytes())
+            {
+                *hook_timer_error.borrow_mut() = Some(error.to_string());
+                let _ = engine.emu_stop();
+                return;
+            }
+            if let Err(error) = pend_interrupt(TRANSFER_COMPLETE_IRQ) {
+                *hook_timer_error.borrow_mut() = Some(error.to_owned());
+                let _ = engine.emu_stop();
+            }
+        }
     })?;
 
     eprintln!(
-        "[CPU] virtual 16-bit timer advances every {INSTRUCTIONS_PER_TIMER_TICK} instructions; secondary-engine start request completes on a timer tick"
+        "[CPU] virtual 16-bit timer advances every {INSTRUCTIONS_PER_TIMER_TICK} instructions; secondary-engine and transfer requests complete on timer ticks"
     );
     Ok(timer_error)
 }
@@ -436,6 +486,7 @@ impl FirmwareRuntime {
     fn load(
         root: &Path,
         force_test_chord: bool,
+        diagnostic_wake_event4: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         const PAGE: usize = 0x1000;
         const RAM_SIZE: usize = 0x0013_4000;
@@ -474,11 +525,31 @@ impl FirmwareRuntime {
         let hook_breakpoints = Rc::clone(&breakpoints);
         let breakpoint_hit = Rc::new(RefCell::new(None));
         let hook_breakpoint_hit = Rc::clone(&breakpoint_hit);
+        let diagnostic_event4_return = Rc::new(Cell::new(None));
+        let hook_diagnostic_event4_return = Rc::clone(&diagnostic_event4_return);
+        let diagnostic_event4_error = Rc::new(RefCell::new(None));
+        let hook_diagnostic_event4_error = Rc::clone(&diagnostic_event4_error);
+        let diagnostic_event4_fired = Rc::new(Cell::new(false));
+        let hook_diagnostic_event4_fired = Rc::clone(&diagnostic_event4_fired);
         core.engine_mut().add_code_hook(1, 0, move |engine, address, _| {
             let mut trace = hook_trace.borrow_mut();
             if trace.len() == 256 { trace.pop_front(); }
             trace.push_back(address as u32);
             drop(trace);
+            if diagnostic_wake_event4
+                && (address as u32 & !1) == EVENT4_WAIT_WRAPPER
+                && !hook_diagnostic_event4_fired.replace(true)
+            {
+                match engine.reg_read(RegisterARM::LR) {
+                    Ok(return_pc) => hook_diagnostic_event4_return.set(Some(return_pc as u32)),
+                    Err(error) => {
+                        *hook_diagnostic_event4_error.borrow_mut() =
+                            Some(format!("failed to read LR at event-4 wait: {error}"));
+                    }
+                }
+                let _ = engine.emu_stop();
+                return;
+            }
             if hook_breakpoints.borrow().contains(&(address as u32 & !1)) {
                 *hook_breakpoint_hit.borrow_mut() = Some(address as u32 & !1);
                 let _ = engine.emu_stop();
@@ -506,6 +577,11 @@ impl FirmwareRuntime {
                 "[INPUT] injecting startup chord C#2/F2/G#2 scan samples until LCD TEST; scheduler/interrupt progress is not guaranteed"
             );
         }
+        if diagnostic_wake_event4 {
+            eprintln!(
+                "[DIAGNOSTIC] the first FUN_600b7924 event-4 wait will return immediately once; this is not a hardware or IRQ model"
+            );
+        }
         Ok(Self {
             core,
             pc: FIRMWARE_BASE | 1,
@@ -517,24 +593,49 @@ impl FirmwareRuntime {
             watch_hit,
             fault,
             timer_error,
+            diagnostic_event4_return,
+            diagnostic_event4_error,
             audio,
             usb,
             force_test_chord,
             test_mode_seen: false,
+            grand_pno_seen: false,
             test_lcd: Ml9040a::default(),
             root: root.to_path_buf(),
             stopped: false,
         })
     }
 
-    fn observe_test_lcd_write(&mut self, register_select: bool, value: u8) {
-        if !self.force_test_chord || self.test_mode_seen {
-            return;
+    fn run_instructions(&mut self, instruction_limit: usize) -> Result<u32, CoreRunError> {
+        let pc = self.core.run(self.pc, instruction_limit)?;
+        if let Some(error) = self.diagnostic_event4_error.borrow_mut().take() {
+            return Err(CoreRunError::Exception(error));
         }
+        if let Some(return_pc) = self.diagnostic_event4_return.take() {
+            self.core
+                .set_register(RegisterARM::PC, u64::from(return_pc))
+                .map_err(CoreRunError::Unicorn)?;
+            self.pc = return_pc | 1;
+            eprintln!(
+                "[DIAGNOSTIC] treated event-4 wait at {EVENT4_WAIT_WRAPPER:#010x} as complete; resumed at {:#010x}",
+                self.pc & !1
+            );
+        } else {
+            self.pc = pc | 1;
+        }
+        Ok(self.pc)
+    }
+
+    fn observe_test_lcd_write(&mut self, register_select: bool, value: u8) {
         let Some(PanelOutput::LcdText { text }) = self.test_lcd.write(register_select, value) else {
             return;
         };
-        if text.to_ascii_uppercase().contains("TEST") {
+        let text_upper = text.to_ascii_uppercase();
+        if !self.grand_pno_seen && text_upper.contains("GRANDPNO") {
+            self.grand_pno_seen = true;
+            eprintln!("[BOOT] GrandPno LCD milestone reached");
+        }
+        if self.force_test_chord && !self.test_mode_seen && text_upper.contains("TEST") {
             self.test_mode_seen = true;
             eprintln!("[INPUT] LCD displays TEST; releasing the startup chord");
         }
@@ -610,8 +711,9 @@ impl FirmwareRuntime {
 pub fn run_firmware_debugger(
     root: &Path,
     force_test_mode: bool,
+    diagnostic_wake_event4: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut runtime = FirmwareRuntime::load(root, force_test_mode)?;
+    let mut runtime = FirmwareRuntime::load(root, force_test_mode, diagnostic_wake_event4)?;
     println!("Firmware debugger ready at {:#010x}. Type 'help' for commands.", runtime.pc & !1);
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -677,7 +779,7 @@ pub fn run_firmware_debugger(
                     let current = runtime.pc & !1;
                     let had_breakpoint = runtime.breakpoints.borrow_mut().remove(&current);
                     *runtime.breakpoint_hit.borrow_mut() = None;
-                    let result = runtime.core.run(runtime.pc, count);
+                    let result = runtime.run_instructions(count);
                     if had_breakpoint { runtime.breakpoints.borrow_mut().insert(current); }
                     runtime.pc = result.unwrap_or_else(|error| {
                         eprintln!("execution error: {error}");
@@ -686,7 +788,7 @@ pub fn run_firmware_debugger(
                 } else {
                     *runtime.breakpoint_hit.borrow_mut() = None;
                     *runtime.watch_hit.borrow_mut() = None;
-                    runtime.pc = match runtime.core.run(runtime.pc, count) {
+                    runtime.pc = match runtime.run_instructions(count) {
                         Ok(pc) => pc | 1,
                         Err(error) => {
                             eprintln!("execution error: {error}");
@@ -892,6 +994,71 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(control_bytes) & SECONDARY_ENGINE_START_BIT,
             0
+        );
+    }
+
+    #[test]
+    fn transfer_channel_completion_dispatches_irq9() {
+        let mut core = ArmV7Core::new().unwrap();
+        core.map_region(0x1000, 0x1000, Prot::ALL).unwrap();
+        core.map_region(0x2000, 0x1000, Prot::ALL).unwrap();
+        core.map_region(0x4000_0000, 0x1000, Prot::ALL).unwrap();
+        core.map_region(0xe000_e000, 0x1000, Prot::ALL).unwrap();
+        attach_virtual_startup_model(&mut core).unwrap();
+
+        core.load_bytes(0xe000_ed08, &0x2000_u32.to_le_bytes())
+            .unwrap();
+        core.load_bytes(0x2000 + 25 * 4, &0x1101_u32.to_le_bytes())
+            .unwrap();
+
+        let mut code = Vec::new();
+        for instruction in [
+            0x480f_u16, // ldr r0, [pc, #60] -> NVIC_ISER
+            0x4910,     // ldr r1, [pc, #64] -> IRQ 9 enable mask
+            0x6001,     // str r1, [r0]
+            0x4810,     // ldr r0, [pc, #64] -> transfer channel control
+            0x4910,     // ldr r1, [pc, #64] -> channel start bit
+            0x6001,     // str r1, [r0]
+            0xe7fe,     // b .
+        ] {
+            code.extend_from_slice(&instruction.to_le_bytes());
+        }
+        core.load_bytes(0x1000, &code).unwrap();
+        core.load_bytes(
+            0x1040,
+            &[
+                0x00, 0xe1, 0x00, 0xe0, // NVIC_ISER
+                0x00, 0x02, 0x00, 0x00, // IRQ 9 enable mask
+                0x20, 0x00, 0x01, 0x40, // transfer control
+                0x00, 0x00, 0x00, 0x80, // start bit
+            ],
+        )
+        .unwrap();
+        core.load_bytes(
+            0x1100,
+            &[
+                0x01, 0x48, // ldr r0, [pc, #4] -> result address
+                0x01, 0x21, // movs r1, #1
+                0x01, 0x60, // str r1, [r0]
+                0x70, 0x47, // bx lr (exception return)
+                0x00, 0x12, 0x00, 0x00, // result address
+            ],
+        )
+        .unwrap();
+        core.set_register(RegisterARM::MSP, 0x1f00).unwrap();
+        core.run(0x1001, INSTRUCTIONS_PER_TIMER_TICK * 2)
+            .unwrap();
+
+        let mut result = [0; 4];
+        core.read_bytes(0x1200, &mut result).unwrap();
+        assert_eq!(u32::from_le_bytes(result), 1);
+
+        let mut status = [0; 4];
+        core.read_bytes(TRANSFER_CHANNEL_1_STATUS, &mut status)
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(status) & 0x0007_0000,
+            TRANSFER_COMPLETE_STATUS
         );
     }
 

@@ -3,6 +3,43 @@
 The native Rust GTK app renders `PSR-E463.svg` and uses `ui/controls.json` for
 SVG IDs, switch matrix codes, piano bindings, and knob geometry.
 
+## Current state and milestones
+
+The panel UI, keyboard/mouse input events, two-contact piano interaction,
+knobs, encoder, and named LED outputs work. The emulator loads and executes
+the supplied firmware images with Unicorn and provides a debugger, smoke-test
+mode, traces, and core dumps. The LCD has an ML9040A character-write model,
+raw bus-event reporting, and generic SVG segment outputs; the seven track
+status shapes are addressable as `LCDTrack1` through `LCDTrack6` and
+`LCDTrackA` (`A` is the accompaniment track). A partial external-flash model
+and several startup/device stand-ins are also present.
+
+This is not yet a complete hardware emulator. Normal firmware execution still
+stalls at the Yamaha boot screen and has not reached the `GrandPno` milestone.
+The correct RTOS wake/interrupt source is unresolved, the fresh-flash boot
+sequence has not been verified, and the seven track indicators are not yet
+automatically attributed from firmware LCD writes. Physical input matrix
+wiring, USB devices, and audio output are also incomplete; timer and startup
+register stand-ins are approximations rather than cycle-accurate hardware.
+
+Prioritized next milestones:
+
+1. Identify and model the evidence-backed event/interrupt path that wakes the
+   boot task, then verify boot reaches `GrandPno` from erased flash and performs
+   the expected initialization writes.
+2. Establish the physical switch/piano matrix mapping and connect ordinary
+   panel input, scan, and LED behavior to firmware rather than only emitting
+   symbolic UI events.
+3. Decode firmware LCD activity into named indicators, including
+   `LCDTrack1`–`LCDTrack6` and `LCDTrackA`, and verify their on/off states
+   against firmware behavior. The UI can already render these IDs when
+   supplied as `lcd_segment` or `lcd_segments_updated` outputs.
+4. Replace provisional peripheral stand-ins with verified models, prioritizing
+   the peripherals exercised by the boot path; then expand USB, audio, and
+   timing behavior.
+5. Add hardware-independent regression tests for the boot path, panel-output
+   mapping, and each peripheral model as those behaviors become reproducible.
+
 ## Build and run
 
 Install Rust, GTK 3 development libraries, librsvg, CMake, a C compiler, and
@@ -64,6 +101,15 @@ resolved driver callback is only a two-instruction success stub and does not
 show that the request starts a transfer. The service manual documents when
 interrupts are unmasked and shows SWX03's USB and flash connections, but does
 not identify the internal IRQ source or map it to `0x40010000`.
+
+For a downstream-only diagnostic, run
+`cargo run -- --debug-firmware --diagnostic-wake-event4`. This makes the first
+call to the `FUN_600b7924` event-4 wait wrapper return immediately, allowing
+inspection of what boot does next. It is a one-shot wait bypass, not an RTOS
+event, interrupt, or hardware model, and does not establish the correct boot
+wake source. The diagnostic run returned from that wait but still reached the
+dispatcher idle loop without displaying `GrandPno`; the flash image remained
+erased. Normal runs remain unchanged.
 
 Start the interactive terminal debugger with `cargo run -- --debug-firmware`.
 It uses the same firmware and virtual peripheral setup as the UI, but waits at
@@ -156,7 +202,10 @@ The Power button closes the app.
 
 Every button emits a JSON press event on mouse/key down and a release event on
 up. The event identifies the SVG element and includes its firmware matrix code
-when one is configured. The 10-key pad is mapped to the numeric keypad, plus
+when one is configured. `Style-2` shares the confirmed `0x13` code with
+`Style`. Panel button codes are taken from the firmware's button-test table;
+the Power button closes the app and has no firmware matrix code. The 10-key
+pad is mapped to the numeric keypad, plus
 and minus use keypad add/subtract, and `z s x d c v g b h n j m` plays a
 chromatic octave starting at C3. Keypad `*` and `/` move the computer-keyboard
 octave up and down, within C1–C5. Clicking the SVG piano keys covers C1–C6.
@@ -172,8 +221,10 @@ center. The two live control knobs have a center detent: values within 6 of 64
 snap to 64. `knobs.regular.center_snap_radius` sets the radius and
 `center_snap_ids` selects which configured knobs use it.
 The rotary encoder reports one direction step for each crossed 15°
-detent. LED buttons light `#f55` only while physically held; the core can also
-set their LED state independently.
+detent. Illuminated buttons are matrix-scanned like the other buttons and do
+not light just because they are pressed. Named `led` outputs light the matching
+button and, for Style, Song, and Groove, their separate indicator artwork in
+the existing `#f55` color.
 
 ## Core interface
 
@@ -191,11 +242,24 @@ are individual raw switch transitions:
 ```
 
 The UI reads `PanelOutput` JSON lines from stdin and applies them to the named
-SVG element. LED and LCD segment IDs are the artwork IDs. LCD text is rendered
+SVG element. `Voice`, `Style`, `Song`, and `Groove` LED outputs also address
+their button-light artwork; Style, Song, and Groove address their separate
+indicator paths as well. Other supported LED and LCD segment IDs are artwork
+IDs. LCD text is rendered
 into the individual 5×8 dot paths in the eight-character `Chars` area. All
 ID-addressable LCD segment paths in the SVG's `LCD` group (excluding the
 backlight) start off as `#bee`; lit segments use cyan. The encoder SVG group
 is configured as `Dial`.
+
+The seven LCD track-status shapes use the stable IDs `LCDTrack1`,
+`LCDTrack2`, `LCDTrack3`, `LCDTrack4`, `LCDTrack5`, `LCDTrack6`, and
+`LCDTrackA`. The `LCD` prefix distinguishes these display indicators from the
+separate interactive `Track1`–`Track6` panel controls. `LCDTrackA` is the
+artwork for the accompaniment track. As with other named segment IDs, these
+can be driven through the generic LCD segment outputs; the current firmware
+path reports raw LCD bus writes but does not yet decode them into these track
+states. For example, `{"type":"lcd_segment","svg_id":"LCDTrack1","lit":true}`
+lights the first track indicator.
 
 The panel artwork is rendered once to a native-size surface. Resizing scales
 that surface; knobs use cached sprites, and switch/LED/LCD changes use Cairo
