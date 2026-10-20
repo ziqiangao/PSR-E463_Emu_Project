@@ -52,10 +52,11 @@ unresolved. The debugger also supports an opt-in one-shot event-4 wait bypass:
 cargo run -- --debug-firmware --diagnostic-wake-event4
 ```
 
-That diagnostic is not an RTOS event or hardware model and has not reached
-`GrandPno`. See [README_EMULATOR_UI.md](./README_EMULATOR_UI.md) for full
-run instructions, debugger commands, panel input/output formats, and model
-details.
+The diagnostic flag starts the firmware debugger by itself; adding
+`--debug-firmware` is optional. It is not an RTOS event or hardware model and
+has not reached `GrandPno`. See [README_EMULATOR_UI.md](./README_EMULATOR_UI.md)
+for full run instructions, debugger commands, panel input/output formats, and
+model details.
 
 ## Milestones
 

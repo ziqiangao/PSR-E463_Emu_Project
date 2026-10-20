@@ -103,13 +103,14 @@ interrupts are unmasked and shows SWX03's USB and flash connections, but does
 not identify the internal IRQ source or map it to `0x40010000`.
 
 For a downstream-only diagnostic, run
-`cargo run -- --debug-firmware --diagnostic-wake-event4`. This makes the first
-call to the `FUN_600b7924` event-4 wait wrapper return immediately, allowing
-inspection of what boot does next. It is a one-shot wait bypass, not an RTOS
-event, interrupt, or hardware model, and does not establish the correct boot
-wake source. The diagnostic run returned from that wait but still reached the
-dispatcher idle loop without displaying `GrandPno`; the flash image remained
-erased. Normal runs remain unchanged.
+`cargo run -- --diagnostic-wake-event4` (or add
+`--debug-firmware --diagnostic-wake-event4`). The diagnostic flag starts the
+debugger by itself and makes the first call to the `FUN_600b7924` event-4 wait
+wrapper return immediately, allowing inspection of what boot does next. It is
+a one-shot wait bypass, not an RTOS event, interrupt, or hardware model, and
+does not establish the correct boot wake source. The diagnostic run returned
+from that wait but still reached the dispatcher idle loop without displaying
+`GrandPno`; the flash image remained erased. Normal runs remain unchanged.
 
 Start the interactive terminal debugger with `cargo run -- --debug-firmware`.
 It uses the same firmware and virtual peripheral setup as the UI, but waits at

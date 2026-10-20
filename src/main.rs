@@ -167,12 +167,9 @@ enum DragTarget {
 
 fn main() -> glib::ExitCode {
     let force_test_mode = env::args().any(|arg| arg == "--force-test-mode");
-    let debug_firmware = env::args().any(|arg| arg == "--debug-firmware");
     let diagnostic_wake_event4 = env::args().any(|arg| arg == "--diagnostic-wake-event4");
-    if diagnostic_wake_event4 && !debug_firmware {
-        eprintln!("--diagnostic-wake-event4 is available only with --debug-firmware");
-        return glib::ExitCode::FAILURE;
-    }
+    let debug_firmware =
+        env::args().any(|arg| arg == "--debug-firmware") || diagnostic_wake_event4;
     if debug_firmware {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         return match psr_e463_ui::cpu::run_firmware_debugger(
