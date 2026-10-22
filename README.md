@@ -15,10 +15,14 @@ external flash commands.
 
 This is not yet a complete hardware emulator. Normal firmware execution still
 stalls at the Yamaha boot screen and has not reached the `GrandPno` milestone.
-The correct RTOS task wake/interrupt source is unresolved, and boot from
-erased flash has not been verified. Several startup peripheral stand-ins are
-approximations, not hardware models. Physical input matrix wiring, USB device
-behavior, and audio output remain incomplete.
+The LCD path is fine: firmware writes `Yamaha`, then the RTOS idles with no
+ready task while waiting on event 4 during flash/backup bring-up. The correct
+wake/interrupt source for that wait is unresolved, and boot from erased flash
+has not been verified through to the main screen. Several startup peripheral
+stand-ins are approximations, not hardware models. Physical input matrix
+wiring, USB device behavior, and audio output remain incomplete. See the
+2026-10-22 notes in
+[NOTES_EMULATOR_REQUIREMENTS.md](./NOTES_EMULATOR_REQUIREMENTS.md).
 
 The seven LCD track-status artwork elements now have stable IDs:
 `LCDTrack1`–`LCDTrack6` and `LCDTrackA` (`A` is the accompaniment track).

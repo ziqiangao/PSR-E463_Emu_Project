@@ -361,6 +361,80 @@ purpose is to determine whether later firmware initialization can reach
 remained fully erased. This confirms the single wait is not the only missing
 boot progression mechanism. Normal runtime behavior is unchanged.
 
+### Yamaha-screen stall rechecked (2026-10-22)
+
+A fresh `--debug-firmware` run reproduced the Yamaha stall and refined the
+first event-4 wait attribution. This is not an LCD fault: the ML9040A path
+writes the opening text correctly, then the RTOS has no ready task, so the
+main-screen path that would show `GrandPno` never runs.
+
+Observed sequence:
+
+1. External flash resets and auto-select/ID complete against an erased
+   `flash.bin` (`0xff` at `0x70000000`).
+2. Execution hits `FUN_600b7924` with `LR = 0x600b7763`. That return address is
+   inside `FUN_600b7752`, not the later `FUN_6009f3de` / `FMD000` path from the
+   2026-10-20 notes. At this stop: current task `0x3f`, ready-group byte
+   `0x08`, event-table pointer `0x01017534 = 0`, and flash still fully erased.
+3. Continuing past that wait, the LCD bus writes ` Yamaha ` (space-padded)
+   through `initialise_yamaha_display_interface` (`0x600a4760`), using the
+   string at `0x600a49b0`.
+4. A later continue settles in the dispatcher idle loop at `0x01006588` /
+   `0x0100658c`, with ready-group `0` and no further LCD text. A write
+   watchpoint on transfer channel start `0x40010020` never fires.
+
+Boot order in `FUN_600b6900` places flash/backup bring-up before the Yamaha
+display call:
+
+- `FUN_600cb99e` → `FUN_600b7752` (event-4 arm / flash magic check / event-4
+  wait)
+- later input and secondary bring-up helpers
+- `initialise_yamaha_display_interface`
+- further product init, then a dispatcher handoff
+
+`FUN_600b7752` itself is:
+
+1. `FUN_600b791e` → `thunk_EXT_FUN_01006ae0(4)` (marks event 4; may wake an
+   existing waiter)
+2. `FUN_600b7970` (reads flash via `FUN_600cba36` / `FUN_600cbdea`, comparing
+   magics `0x7777` and `0xcccc`, with an erased-`0xffff` branch through
+   `FUN_600b78d0`)
+3. `FUN_600b7924` → `thunk_EXT_FUN_01006a9a(4)` (blocks the current task on
+   event 4)
+
+On a fully erased image, `FUN_600b7970` returns nonzero (`0xffffffff` when the
+`0xcccc` companion pattern is absent). `FUN_600cb99e` then takes the
+`FUN_6009ff70` early-exit path once the wait returns. The wait itself still
+requires a later event-4 signal that the emulator never produces.
+
+`GrandPno` is present as packed 8-character voice-name data at `0x6013cd16`
+and `0x6013d67e` (adjacent names include `OctPiano`, `BritePno`). No code
+xref to those bytes was resolved in this pass; the string is a UI milestone,
+not evidence that splash handling is broken. `PORTABLE GRAND` at `0x600e3480`
+sits next to the `YAMAHA` category label and is a separate string.
+
+What this rules out for the current stall:
+
+- LCD controller bring-up (Yamaha text is emitted on the modeled bus)
+- CFI / flash-geometry bring-up (already past; scheduling is reached)
+- Erased flash as a hard fault by itself (firmware has an erased-flash branch)
+- The conditional `0x40010000` / IRQ 9 transfer stand-in as the wake source for
+  this first wait (boot never writes `0x40010020` before idle)
+
+What remains unresolved, and is the milestone-1 blocker:
+
+- The peripheral or software producer that should signal event 4 after the
+  `FUN_600b7752` flash/backup check
+- Any later event-4 waits on the same API (including the previously traced
+  `FMD000` path), since `--diagnostic-wake-event4` still fails to reach
+  `GrandPno`
+- Why the event-table pointer at `0x01017534` is zero when the first wait is
+  entered
+
+Do not invent a wake by forcing ready bitmaps, asserting IRQ 9 without a
+matching `0x40010020` start, or treating the diagnostic one-shot bypass as a
+hardware model.
+
 The refreshed SVG includes an eight-character dot-matrix area (`Chars`, with
 `Char1`–`Char8`). The supplied controller identification is ML9040A-B01GA.
 `src/lcd.rs` provides a software register-level model for instruction/data

@@ -16,11 +16,15 @@ and several startup/device stand-ins are also present.
 
 This is not yet a complete hardware emulator. Normal firmware execution still
 stalls at the Yamaha boot screen and has not reached the `GrandPno` milestone.
-The correct RTOS wake/interrupt source is unresolved, the fresh-flash boot
-sequence has not been verified, and the seven track indicators are not yet
-automatically attributed from firmware LCD writes. Physical input matrix
-wiring, USB devices, and audio output are also incomplete; timer and startup
-register stand-ins are approximations rather than cycle-accurate hardware.
+The LCD writes `Yamaha` successfully; the stall is an RTOS idle after an
+event-4 wait in flash/backup bring-up (`FUN_600b7752`), not a display-model
+failure. The correct wake/interrupt source is unresolved, the fresh-flash boot
+sequence has not been verified through to the main screen, and the seven track
+indicators are not yet automatically attributed from firmware LCD writes.
+Physical input matrix wiring, USB devices, and audio output are also
+incomplete; timer and startup register stand-ins are approximations rather
+than cycle-accurate hardware. Details are in the 2026-10-22 section of
+[NOTES_EMULATOR_REQUIREMENTS.md](./NOTES_EMULATOR_REQUIREMENTS.md).
 
 Prioritized next milestones:
 
@@ -93,12 +97,13 @@ still stalls at `0x01006588` waiting for an event source that has not yet been
 identified. The emulator now handles Cortex-M SVC and enabled/pending NVIC
 exceptions through the firmware vector table, but does not synthesize a
 keyboard or timer interrupt without evidence for its hardware source.
-A debugger trace also shows the boot-time event-4 wait without any access to
-the `0x40010000` controller; its known IRQ 9 setup is reached from USB state
-handling, so the emulator does not assert that IRQ as a speculative wakeup.
-The wait follows a request for the firmware volume `FMD000`, but Ghidra's
-resolved driver callback is only a two-instruction success stub and does not
-show that the request starts a transfer. The service manual documents when
+A debugger trace shows the first boot-time event-4 wait in `FUN_600b7752`
+(flash/backup magic check) without any access to the `0x40010000` controller;
+a write watch on `0x40010020` does not fire before idle. The known IRQ 9 setup
+is reached from USB/transfer state handling, so the emulator does not assert
+that IRQ as a speculative wakeup. A later `FMD000` volume path also waits on
+event 4 after a two-instruction success-stub callback, but that is not the
+first wait observed at the Yamaha stall. The service manual documents when
 interrupts are unmasked and shows SWX03's USB and flash connections, but does
 not identify the internal IRQ source or map it to `0x40010000`.
 
