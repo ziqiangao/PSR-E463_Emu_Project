@@ -50,7 +50,18 @@ The surrounding `FUN_600b177e` setup calls `FUN_600b84e2` with the USB product s
 
 The emulator maps the `0x40005000` page and observes writes to `0x40005028`. Its provisional model treats bit 1 as USB host enable and bit 2 as USB device enable. The virtual USB TO DEVICE host and USB TO HOST device stay disconnected; no mass-storage device, USB audio stream, or USB MIDI peer is synthesized. The register backing allows firmware read-modify-write setup to continue, while the controller model reports no attached peer.
 
-The follow-on write at `PC=0x600c9a7e`, `address=0x420a0508`, is the Cortex-M peripheral bit-band alias for bit 2 of `0x40005028`: alias offset `0x000a0508` decodes to peripheral byte offset `0x5028`, bit 2. Ghidra's `DAT_600ca218` contains this alias address, and the secondary-engine initializer writes `1` to it. `src/bitband.rs` maps the peripheral alias window and translates alias reads/writes to the target peripheral bit. Execution then polls the 16-bit counter at `0x40000018` for a 300-tick delay. The live, debug, and smoke-test runtimes advance that counter once per 1,024 guest instructions, a deterministic approximation rather than a hardware-accurate timer model. The secondary-engine control page and its 0x8000-byte configuration/RAM window are also mapped in all three runners. The start-request bit at `0x40030000` is modeled as completing on the next virtual timer tick; the true peripheral behavior is unconfirmed.
+The follow-on write at `PC=0x600c9a7e`, `address=0x420a0508`, is the Cortex-M peripheral bit-band alias for bit 2 of `0x40005028`: alias offset `0x000a0508` decodes to peripheral byte offset `0x5028`, bit 2. Ghidra's `DAT_600ca218` contains this alias address, and the secondary-engine initializer writes `1` to it. `src/bitband.rs` maps the peripheral alias window and translates alias reads/writes to the target peripheral bit. Execution then polls the 16-bit counter at `0x40000018` for a 300-tick delay. The live, debug, and smoke-test runtimes advance that counter once per 1,024 guest instructions. This is the emulator's virtual cadence, not a documented duration in seconds: the service manual has no SWX03 timer/prescaler map from which to derive a physical tick period. The secondary-engine control page and its 0x8000-byte configuration/RAM window are also mapped in all three runners. The start-request bit at `0x40030000` is modeled as completing on the next virtual timer tick; the true peripheral behavior is unconfirmed.
+
+The emulator's discrete one-shot timer bank interprets each set mask bit as a
+separate channel: bit 0 is channel 1, bit 2 (mask `4`) is channel 3. An armed
+channel expires at the next virtual counter tick, i.e. after the next 1,024
+guest instructions, independent of wall-clock pacing. The transfer-start
+request arms channel 3; its expiration completes the modeled transfer, sets
+the observed completion status, and pends the already-evidenced IRQ 9. No
+other timer channel is connected to an IRQ, because the firmware/manual
+evidence does not establish a timer IRQ number or generic timer register
+interface. These timer channels are emulator scheduling events, not the
+firmware notification masks passed to `FUN_600bfbe6`.
 
 ### What the firmware-mapped placeholder pages appear to be
 
@@ -63,13 +74,13 @@ most of these internal address pages.
 
 | Mapped page or region | What is supported by evidence | What remains a stand-in or unknown |
 |---|---|---|
-| `0x40000000..0x40000fff` | `0x40000018` is polled as a 16-bit counter in `InitializeSecondaryEngine`; `0x40000028` is polled by startup code. | Only the timer counter has deterministic virtual behavior. The counter's actual SWX03 timer/prescaler and the `0x40000028` status source are unidentified; the rest of the page is zero-backed. |
+| `0x40000000..0x40000fff` | `0x40000018` is polled as a 16-bit counter in `InitializeSecondaryEngine`; `0x40000028` is polled by startup code. | The counter advances once per 1,024 guest instructions and is not assigned a physical duration. The counter's actual SWX03 timer/prescaler and the `0x40000028` status source are unidentified; the rest of the page is zero-backed. |
 | `0x40001000..0x40001fff` | GPIO register offsets `0x100..0x10a` and scan interface `0x112` are used. Ghidra and the manual identify PA3–PA10 as LCD data, PA11 as RS, PA12 as ENB, and PA2 as DAC reset. | GPIO state and LCD bus edges are modeled; scans are all-open by default. `--force-test-mode` injects the service chord's logical scan IDs, but physical matrix wiring remains unresolved. |
 | `0x40002000..0x40002fff` | A driver write of `0xf000` to `0x40002700` at `0x0100178e` is observed when this page is mapped. | No base-address references or manual diagram currently identify this page; it remains a zero-backed startup stub. |
 | `0x40004000..0x40004fff` | Firmware uses the transfer registers at `0x40004008..0x4000400e`; the service-manual diagram shows SWX03 serial-audio pins and the board's ADC/DAC/amp devices. | `0x4000400c` is routed to dummy DAC/amp sinks and `0x4000400e` is partially interpreted from firmware behavior. Register-to-pin mapping and device status behavior remain provisional. |
 | `0x40005000..0x40005fff` | `0x40005028` is a shared USB host/device enable/configuration word, inferred from the `USB000` storage path and `Digital Keyboard`/`iAP_Interface` setup. | Host and device peers remain disconnected; exact register and bit definitions are unconfirmed. |
 | `0x40008000..0x40008fff`, `0x40009000..0x40009fff`, `0x4000a000..0x4000afff` | Firmware startup and `FUN_60086824` write these blocks; Ghidra also finds writes to them in `FUN_68006bfc`. The initialization includes pointer/field values and the word `0x1589` at `0x40008000`. | They are a real firmware-touched startup interface, not arbitrary holes, but no manual page or traced consumer identifies the hardware block or register meanings. These pages remain zero-backed. |
-| `0xe000e000..0xe000efff` | Cortex-M system-control space; startup writes `SCB->VTOR` at `0xe000ed08`. | Basic exception entry/return, VTOR dispatch, NVIC enable/disable/pending/priority state, and PRIMASK/BASEPRI gating are modeled. SysTick countdown and device-to-IRQ wiring are not. |
+| `0xe000e000..0xe000efff` | Cortex-M system-control space; startup writes `SCB->VTOR` at `0xe000ed08`. | Basic exception entry/return, VTOR dispatch, NVIC enable/disable/pending/priority state, and PRIMASK/BASEPRI gating are modeled. SysTick countdown and generic timer-to-IRQ wiring are not. |
 | `0x40030000..0x40030fff`, `0x40038000..0x4003ffff` | `InitializeSecondaryEngine` polls control bit 2, writes configuration fields and clears `0x7f00` bytes starting at `0x40038100`; its command helper accesses the `0x40038000` window. | The secondary-engine/DSP identification is context-based, not confirmed by the manual. The control bit auto-completion and memory window are firmware-progress stand-ins, not validated hardware models. |
 
 The virtual timer and secondary-engine startup behavior are thus the only
@@ -232,13 +243,13 @@ current-task field at `0x0101732c` is `0xff`, and both the ready-group byte
 
 The active task got as far as `FUN_6009f3de(1, 1)`, which calls
 `FUN_600b7924()` and then the driver wait API
-`thunk_EXT_FUN_01006a9a(4)`. This blocks on event 4; the scheduler itself is
-executing as designed, but no task is ready to dispatch. An observed producer
-of event 4 is the IRQ 9 handler at `0x600ac8fc`: it signals event 4 through
-`FUN_600bfbe6(..., 4)` when the status field at `0x40010024` reports code 5.
-That identifies a transfer-completion wake path, but does not yet prove that
-this particular boot-time wait initiated that transfer or identify the device
-that should produce the status.
+`thunk_EXT_FUN_01006a9a(4)`. This blocks on driver wait key 4; the scheduler
+itself is executing as designed, but no task is ready to dispatch. An IRQ 9
+status path calls `FUN_600bfbe6(..., 4)` when the status field at
+`0x40010024` reports code 5. The `4` here is a notification mask passed to a
+different helper, not evidence that IRQ 9 signals driver wait key 4. The
+transfer path may wake tasks subscribed to that notification, but does not
+identify the producer for the boot-time wait.
 
 The startup sequence reaches `0x600b698a`, which calls `FUN_6008bb8c`. That
 initializer registers the input driver through `FUN_01000b2c`, configures
@@ -274,7 +285,8 @@ and interrupt assertion behavior remain unmodeled. Do not connect the
 input-scan controller to these IRQs without additional evidence.
 
 A 10-million-instruction debug run reaches `0x01006588` after
-`FUN_600a0a18` calls `FUN_600bf2c8`/`FUN_600cd420` and then waits on event 4.
+`FUN_600a0a18` calls `FUN_600bf2c8`/`FUN_600cd420` and then waits on driver
+wait key 4.
 The first breakpoint at `0x01006588` is the dispatcher's first ready-group
 poll, not by itself proof of a permanent stall: that snapshot showed `0xff` at
 `0x0101732c`, `1` at `0x0101732d`, and `0` at `0x01017330`. After removing the
@@ -320,7 +332,7 @@ callback. At the callback call site (`0x600cd444`), the function pointer is
 `0x600fd46f`; the Thumb code at `0x600fd46e` is `movs r0, #0; bx lr`, so this
 callback returns success without performing visible device I/O. The caller
 then executes `FUN_6009f3de(1, 1)`, which invokes
-`thunk_EXT_FUN_01006a9a(4)`. Thus the event-4 wait follows an `FMD000` driver
+`thunk_EXT_FUN_01006a9a(4)`. Thus the key-4 wait follows an `FMD000` driver
 dispatch, but the resolved callback does not establish that this operation
 starts a transfer or needs IRQ 9. A debugger run reaches the dispatcher
 without accessing `0x40010000`; no controller status or completion request is
@@ -344,15 +356,15 @@ reached before the observed idle loop. The PendSV and SysTick vectors are
 self-loops and cannot provide a fallback scheduler tick.
 
 At the idle-loop snapshot, the event-table pointer at `0x01017534` is zero and
-the event-4 lookup in `FUN_01006a08` consequently finds no registered waiter.
+the key-4 lookup in `FUN_01006a08` consequently finds no registered waiter.
 The boot task reaches the `FUN_600b7924` wrapper, which calls the driver wait
-API for event 4, then the dispatcher has no ready task. The resolved `FMD000`
+API for key 4, then the dispatcher has no ready task. The resolved `FMD000`
 callback still returns success without visible I/O; neither it nor the trace
 identifies what should complete the wait. Do not treat the conditional
 transfer stand-in as the boot source or modify ready bitmaps to force progress.
 
 For downstream diagnosis only, `--debug-firmware --diagnostic-wake-event4`
-returns immediately from the first `FUN_600b7924` event-4 wait wrapper. This
+returns immediately from the first `FUN_600b7924` key-4 wait wrapper. This
 one-shot bypass does not signal an RTOS event or emulate a peripheral; its
 purpose is to determine whether later firmware initialization can reach
 `GrandPno` when this wait is skipped. The run returned from that wait to
@@ -364,7 +376,7 @@ boot progression mechanism. Normal runtime behavior is unchanged.
 ### Yamaha-screen stall rechecked (2026-10-22)
 
 A fresh `--debug-firmware` run reproduced the Yamaha stall and refined the
-first event-4 wait attribution. This is not an LCD fault: the ML9040A path
+first driver key-4 wait attribution. This is not an LCD fault: the ML9040A path
 writes the opening text correctly, then the RTOS has no ready task, so the
 main-screen path that would show `GrandPno` never runs.
 
@@ -386,26 +398,26 @@ Observed sequence:
 Boot order in `FUN_600b6900` places flash/backup bring-up before the Yamaha
 display call:
 
-- `FUN_600cb99e` → `FUN_600b7752` (event-4 arm / flash magic check / event-4
-  wait)
+- `FUN_600cb99e` → `FUN_600b7752` (driver key-4 arm / flash magic check /
+  driver key-4 wait)
 - later input and secondary bring-up helpers
 - `initialise_yamaha_display_interface`
 - further product init, then a dispatcher handoff
 
 `FUN_600b7752` itself is:
 
-1. `FUN_600b791e` → `thunk_EXT_FUN_01006ae0(4)` (marks event 4; may wake an
+1. `FUN_600b791e` → `thunk_EXT_FUN_01006ae0(4)` (sets driver key 4; may wake an
    existing waiter)
 2. `FUN_600b7970` (reads flash via `FUN_600cba36` / `FUN_600cbdea`, comparing
    magics `0x7777` and `0xcccc`, with an erased-`0xffff` branch through
    `FUN_600b78d0`)
 3. `FUN_600b7924` → `thunk_EXT_FUN_01006a9a(4)` (blocks the current task on
-   event 4)
+   driver wait key 4)
 
 On a fully erased image, `FUN_600b7970` returns nonzero (`0xffffffff` when the
 `0xcccc` companion pattern is absent). `FUN_600cb99e` then takes the
 `FUN_6009ff70` early-exit path once the wait returns. The wait itself still
-requires a later event-4 signal that the emulator never produces.
+requires the driver key-4 completion that the emulator never produces.
 
 `GrandPno` is present as packed 8-character voice-name data at `0x6013cd16`
 and `0x6013d67e` (adjacent names include `OctPiano`, `BritePno`). No code
@@ -423,9 +435,9 @@ What this rules out for the current stall:
 
 What remains unresolved, and is the milestone-1 blocker:
 
-- The peripheral or software producer that should signal event 4 after the
-  `FUN_600b7752` flash/backup check
-- Any later event-4 waits on the same API (including the previously traced
+- The peripheral or software producer that should complete driver key 4 after
+  the `FUN_600b7752` flash/backup check
+- Any later key-4 waits on the same API (including the previously traced
   `FMD000` path), since `--diagnostic-wake-event4` still fails to reach
   `GrandPno`
 - Why the event-table pointer at `0x01017534` is zero when the first wait is
@@ -434,6 +446,92 @@ What remains unresolved, and is the milestone-1 blocker:
 Do not invent a wake by forcing ready bitmaps, asserting IRQ 9 without a
 matching `0x40010020` start, or treating the diagnostic one-shot bypass as a
 hardware model.
+
+### Speaker mute path versus driver wait key 4 (2026-10-22)
+
+The service manual makes speaker/DAC muting a plausible startup dependency,
+but the available evidence does not identify it as the producer for driver
+wait key 4:
+
+- The system boot flow (PDF page 21, printed page 56) explicitly says startup
+  deasserts the DAC reset / mute signal at SWX03 pin 131, PA2 (`/MUTE`, low to
+  high) before backup-data initialization and PCM initialization. This is a
+  hardware GPIO control, not described as an RTOS event key.
+- The overall circuit diagram (PDF page 36, printed circuit page 1) shows the
+  CPU's `MUTE` net separately from the headphone-related `HP-MUTE` and the
+  `DAMP-MUTE` net feeding the YDA176 (IC251) path. The drawing includes the
+  AK4430 DAC (IC201), YDA176 digital amplifier, headphone/mute circuitry, and
+  output amplifier. It supports distinct mute/reset and amplifier/headphone
+  paths; it does not show a connection from those nets to driver wait key 4 or
+  an interrupt/event source.
+- The service test section (PDF page 11) distinguishes test 018, `SP MUTE
+  Check` (expects `SP OK`, with no headphone plug), from test 019, `MUTE Check`
+  (plays C5 and explicitly checks speaker and headphone output while muting
+  is toggled). This matters because a speaker-mute check is not, by itself,
+  evidence of the boot-time key-4 event.
+- Firmware function `toggle_sp_output_and_verify` at `0x600b2b50` displays
+  `SP Off`/`SP On`, sets/clears bit 14 in the third halfword of a shared status
+  structure, and polls bit 15 of its first halfword for the state transition
+  (up to 50,000 iterations with 10-unit delays per poll). It then queues
+  secondary-buffer command bytes and reports the result. The function does
+  not call the driver key-4 wait API; the relationship of those status bits
+  and queued commands to the physical mute circuitry is not fully resolved.
+- The live emulator's audio path currently records opaque transfers to dummy
+  AK4430/YDA176 sinks. It does not model DAC reset/mute, the headphone-detect
+  logic, the YDA176 mute/status behavior, or the resulting analog output. This
+  is a credible source of missing behavior to investigate, but no trace has
+  shown that one of those missing responses is what releases key 4.
+
+The first boot wait remains in `FUN_600b7752`: it sets driver key 4, checks
+flash/backup magic, then waits on key 4. No direct call or state link from that
+routine to `toggle_sp_output_and_verify` has been found. Next, trace the boot
+write to PA2 and the downstream `MUTE`/DAC response independently from the
+driver key-4 state transition; only connect them if firmware data flow or a
+runtime trace demonstrates that link. Do not make the virtual amplifier
+assert key 4 merely because the manual documents mute behavior.
+
+An experimental run that pended IRQ 1 on every virtual timer tick did not
+resolve the stall. It exercised the driver's SVC context-switch path, where
+the SVC handler saves EXC_RETURN on the stack, calls a helper (overwriting LR),
+then restores the exception token with `pop {pc}`. The emulator previously
+looked only at LR when handling Unicorn's return hook, causing a loop in the
+SVC handler and eventually an unsupported interrupt at PC 0. Exception return
+now recognizes an EXC_RETURN token from the stacked PC as well as LR, and a
+regression test covers a helper call before `pop {pc}`. With that correction,
+the IRQ 1 experiment runs further but still settles in the RTOS dispatcher
+without reaching `GrandPno`; no evidence yet establishes IRQ 1 as the needed
+timer source or task wake. The speculative periodic IRQ assertion has therefore
+been removed. The exception-return correction remains as core behavior needed
+for firmware SVC handlers.
+
+### RTOS wake keys versus firmware notification masks (2026-10-22)
+
+The disassembly has two different mechanisms whose values were both described
+as “event numbers.” Keep them separate when tracing wakeups:
+
+- The boot task's wait key is the argument to the driver API:
+  `FUN_600b791e` calls `thunk_EXT_FUN_01006ae0(4)` before the flash check, and
+  `FUN_600b7924` calls `thunk_EXT_FUN_01006a9a(4)` afterward. The former sets
+  the driver's per-key state; the latter looks up that key and blocks/updates
+  the task wait state. `FUN_01006a08` performs the key lookup. At the first
+  boot wait, the observed registry pointer at `0x01017534` is zero, so no
+  registered waiter mapping was present in that snapshot.
+- `FUN_600bfbe6(handle, mask)` is a separate firmware notification mechanism.
+  It ORs the supplied mask into a per-handle pending word, checks three
+  subscription slots and their match rules, and calls `FUN_010061ae` for
+  matching task IDs. Its second argument is a bitmask, not the driver wait
+  key. The IRQ 9 status-code-5 path calls it with mask `4`; other transfer or
+  status paths use masks including `1`, `0x10`, and `0x20`.
+
+Therefore the IRQ 9 notification with mask `4` does not establish that IRQ 9
+wakes the boot task blocked on driver key `4`. In the fresh boot trace, the
+first key-4 wait occurs in `FUN_600b7752` before any observed write to the
+transfer start register `0x40010020`; no matching IRQ 9 source is established.
+The remaining investigation is to identify the driver key-4 producer (or
+registration path), then determine whether it relates to any of the separate
+notification-mask subscriptions. The `[CPU event N]` prefixes in emulator
+logs are only sequential diagnostic log counters, not firmware wake keys or
+notification masks.
 
 The refreshed SVG includes an eight-character dot-matrix area (`Chars`, with
 `Char1`–`Char8`). The supplied controller identification is ML9040A-B01GA.

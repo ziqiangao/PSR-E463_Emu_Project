@@ -16,10 +16,11 @@ and several startup/device stand-ins are also present.
 
 This is not yet a complete hardware emulator. Normal firmware execution still
 stalls at the Yamaha boot screen and has not reached the `GrandPno` milestone.
-The LCD writes `Yamaha` successfully; the stall is an RTOS idle after an
-event-4 wait in flash/backup bring-up (`FUN_600b7752`), not a display-model
-failure. The correct wake/interrupt source is unresolved, the fresh-flash boot
-sequence has not been verified through to the main screen, and the seven track
+The LCD writes `Yamaha` successfully; the stall is an RTOS idle after waiting
+on driver key 4 during flash/backup bring-up (`FUN_600b7752`), not a
+display-model failure. The correct wake/interrupt source is unresolved, the
+fresh-flash boot sequence has not been verified through to the main screen,
+and the seven track
 indicators are not yet automatically attributed from firmware LCD writes.
 Physical input matrix wiring, USB devices, and audio output are also
 incomplete; timer and startup register stand-ins are approximations rather
@@ -64,10 +65,16 @@ The live UI, debugger, and smoke-test firmware runtimes model the observed
 16-bit counter at `0x40000018` as a free-running virtual timer, advancing it
 once per 1,024 guest instructions. This deterministic approximation allows
 timer polling loops to progress; it is not a cycle-accurate model of the SWX03
-timer or its prescaler. The secondary-engine startup path also uses zero-backed
-control registers at `0x40030000` and a `0x8000`-byte RAM/configuration window
-at `0x40038000`; the observed start-request bit completes on the next virtual
-timer tick. These are minimal firmware-progress stand-ins, not hardware models.
+timer or its prescaler, and 1,024 guest instructions do not establish a
+wall-clock tick duration. One-shot virtual timer masks are split into discrete
+channels; mask `4` selects channel 3 and expires on the next virtual timer
+tick. That channel completes the already-modeled transfer request and raises
+its existing IRQ 9. Other timer channels have no inferred guest register
+interface or IRQ mapping and do not assert interrupts. The secondary-engine
+startup path also uses zero-backed control registers at `0x40030000` and a
+`0x8000`-byte RAM/configuration window at `0x40038000`; the observed
+start-request bit completes on the next virtual timer tick. These are minimal
+firmware-progress stand-ins, not hardware models.
 Other zero-backed startup pages are documented with their Ghidra evidence and
 confidence in [NOTES_EMULATOR_REQUIREMENTS.md](NOTES_EMULATOR_REQUIREMENTS.md);
 the service manual's block diagrams do not provide an internal SWX03 register
@@ -97,12 +104,15 @@ still stalls at `0x01006588` waiting for an event source that has not yet been
 identified. The emulator now handles Cortex-M SVC and enabled/pending NVIC
 exceptions through the firmware vector table, but does not synthesize a
 keyboard or timer interrupt without evidence for its hardware source.
-A debugger trace shows the first boot-time event-4 wait in `FUN_600b7752`
-(flash/backup magic check) without any access to the `0x40010000` controller;
+A trial that pended IRQ 1 on each virtual timer tick did not wake the boot task
+and has been removed; the scheduler still reaches idle without `GrandPno`.
+A debugger trace shows the first boot-time wait on driver key 4 in
+`FUN_600b7752` (flash/backup magic check) without any access to the
+`0x40010000` controller;
 a write watch on `0x40010020` does not fire before idle. The known IRQ 9 setup
 is reached from USB/transfer state handling, so the emulator does not assert
 that IRQ as a speculative wakeup. A later `FMD000` volume path also waits on
-event 4 after a two-instruction success-stub callback, but that is not the
+driver key 4 after a two-instruction success-stub callback, but that is not the
 first wait observed at the Yamaha stall. The service manual documents when
 interrupts are unmasked and shows SWX03's USB and flash connections, but does
 not identify the internal IRQ source or map it to `0x40010000`.
@@ -110,10 +120,10 @@ not identify the internal IRQ source or map it to `0x40010000`.
 For a downstream-only diagnostic, run
 `cargo run -- --diagnostic-wake-event4` (or add
 `--debug-firmware --diagnostic-wake-event4`). The diagnostic flag starts the
-debugger by itself and makes the first call to the `FUN_600b7924` event-4 wait
-wrapper return immediately, allowing inspection of what boot does next. It is
-a one-shot wait bypass, not an RTOS event, interrupt, or hardware model, and
-does not establish the correct boot wake source. The diagnostic run returned
+debugger by itself and makes the first call to the `FUN_600b7924` driver
+key-4 wait wrapper return immediately, allowing inspection of what boot does
+next. It is a one-shot wait bypass, not an RTOS event, interrupt, or hardware
+model, and does not establish the correct boot wake source. The diagnostic run returned
 from that wait but still reached the dispatcher idle loop without displaying
 `GrandPno`; the flash image remained erased. Normal runs remain unchanged.
 

@@ -30,6 +30,7 @@ const DRIVER_BASE: u32 = 0x0100_0000;
 const INSTRUCTIONS_PER_TICK: usize = 25_000;
 const SYSTEM_TIMER_COUNTER: u32 = 0x4000_0018;
 const INSTRUCTIONS_PER_TIMER_TICK: usize = 1_024;
+const TRANSFER_TIMER_MASK: u32 = 1 << 2;
 const SECONDARY_ENGINE_CONTROL: u32 = 0x4003_0000;
 const SECONDARY_ENGINE_START_BIT: u32 = 1 << 2;
 const TRANSFER_CHANNEL_1_CONTROL: u32 = 0x4001_0020;
@@ -41,6 +42,21 @@ const EVENT4_WAIT_WRAPPER: u32 = 0x600b_7924;
 const INPUT_SCAN_CHANNEL_COUNT: usize = 16;
 const INPUTS_PER_SCAN_CHANNEL: usize = 6;
 const TEST_MODE_KEY_IDS: [u8; 3] = [15, 19, 22];
+
+#[derive(Default)]
+struct DiscreteTimerBank {
+    armed_mask: u32,
+}
+
+impl DiscreteTimerBank {
+    fn arm(&mut self, mask: u32) {
+        self.armed_mask |= mask;
+    }
+
+    fn advance_tick(&mut self) -> u32 {
+        std::mem::take(&mut self.armed_mask)
+    }
+}
 
 /// Event-level stand-in for the SWX03 CPU while firmware loading/execution is
 /// intentionally disabled. Inputs are logged and forwarded as JSON lines;
@@ -381,7 +397,7 @@ pub fn attach_virtual_startup_model(
 
     let timer_counter = Rc::new(Cell::new(0_u16));
     let engine_start_pending = Rc::new(Cell::new(false));
-    let transfer_pending = Rc::new(Cell::new(false));
+    let transfer_timers = Rc::new(RefCell::new(DiscreteTimerBank::default()));
     let timer_error = Rc::new(RefCell::new(None));
     let hook_engine_start_pending = Rc::clone(&engine_start_pending);
     core.engine_mut().add_mem_hook(
@@ -396,14 +412,14 @@ pub fn attach_virtual_startup_model(
         },
     )?;
 
-    let hook_transfer_pending = Rc::clone(&transfer_pending);
+    let hook_transfer_timers = Rc::clone(&transfer_timers);
     core.engine_mut().add_mem_hook(
         HookType::MEM_WRITE,
         u64::from(TRANSFER_CHANNEL_1_CONTROL),
         u64::from(TRANSFER_CHANNEL_1_CONTROL),
         move |_, _, _, _, value| {
             if value as u32 & TRANSFER_CHANNEL_START_BIT != 0 {
-                hook_transfer_pending.set(true);
+                hook_transfer_timers.borrow_mut().arm(TRANSFER_TIMER_MASK);
             }
             false
         },
@@ -411,7 +427,7 @@ pub fn attach_virtual_startup_model(
 
     let hook_timer_counter = Rc::clone(&timer_counter);
     let hook_engine_start_pending = Rc::clone(&engine_start_pending);
-    let hook_transfer_pending = Rc::clone(&transfer_pending);
+    let hook_transfer_timers = Rc::clone(&transfer_timers);
     let hook_timer_error = Rc::clone(&timer_error);
     let pend_interrupt = core.interrupt_pender();
     let mut instructions_since_timer_tick = 0;
@@ -431,7 +447,6 @@ pub fn attach_virtual_startup_model(
             let _ = engine.emu_stop();
             return;
         }
-
         // Firmware polls this request bit until the secondary engine clears it.
         if hook_engine_start_pending.replace(false) {
             let mut control_bytes = [0; 4];
@@ -451,7 +466,8 @@ pub fn attach_virtual_startup_model(
             }
         }
 
-        if hook_transfer_pending.replace(false) {
+        let expired_timers = hook_transfer_timers.borrow_mut().advance_tick();
+        if expired_timers & TRANSFER_TIMER_MASK != 0 {
             let mut status_bytes = [0; 4];
             if let Err(error) =
                 engine.mem_read(u64::from(TRANSFER_CHANNEL_1_STATUS), &mut status_bytes)
@@ -477,7 +493,7 @@ pub fn attach_virtual_startup_model(
     })?;
 
     eprintln!(
-        "[CPU] virtual 16-bit timer advances every {INSTRUCTIONS_PER_TIMER_TICK} instructions; secondary-engine and transfer requests complete on timer ticks"
+        "[CPU] virtual 16-bit timer advances every {INSTRUCTIONS_PER_TIMER_TICK} instructions; one-shot timer masks expire on the next virtual tick"
     );
     Ok(timer_error)
 }
@@ -995,6 +1011,18 @@ mod tests {
             u32::from_le_bytes(control_bytes) & SECONDARY_ENGINE_START_BIT,
             0
         );
+    }
+
+    #[test]
+    fn discrete_timer_mask_expires_independent_channels_once() {
+        let mut timers = DiscreteTimerBank::default();
+        timers.arm(0b0101); // Timer channels 1 and 3.
+
+        assert_eq!(timers.advance_tick(), 0b0101);
+        assert_eq!(timers.advance_tick(), 0);
+
+        timers.arm(TRANSFER_TIMER_MASK); // Mask 4 selects timer channel 3.
+        assert_eq!(timers.advance_tick(), TRANSFER_TIMER_MASK);
     }
 
     #[test]

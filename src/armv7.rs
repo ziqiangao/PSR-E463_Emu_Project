@@ -47,9 +47,13 @@ pub struct ArmV7Core {
 
 enum ExceptionEvent {
     Svc,
-    Return,
+    Return {
+        pc: u32,
+        lr: u32,
+        stacked_pc: Option<u32>,
+    },
     Pending(u16),
-    Unsupported(u32),
+    Unsupported(u32, u32),
     Failure(String),
 }
 
@@ -298,15 +302,25 @@ impl ArmV7Core {
             match event {
                 ExceptionEvent::Svc => enter_exception(&mut self.engine, SVC_EXCEPTION)
                     .map_err(CoreRunError::Exception)?,
-                ExceptionEvent::Return => {
-                    return_from_exception(&mut self.engine).map_err(CoreRunError::Exception)?
+                ExceptionEvent::Return { pc, lr, stacked_pc } => {
+                    let exception_return = [pc, lr, stacked_pc.unwrap_or_default()]
+                        .into_iter()
+                        .find(|value| is_exception_return(*value));
+                    if let Some(token) = exception_return {
+                        write_register(&mut self.engine, RegisterARM::LR, u64::from(token))
+                            .map_err(CoreRunError::Exception)?;
+                        return_from_exception(&mut self.engine).map_err(CoreRunError::Exception)?;
+                    } else {
+                        write_register(&mut self.engine, RegisterARM::PC, u64::from(lr & !1))
+                            .map_err(CoreRunError::Exception)?;
+                    }
                 }
                 ExceptionEvent::Pending(exception) => {
                     enter_exception(&mut self.engine, exception).map_err(CoreRunError::Exception)?
                 }
-                ExceptionEvent::Unsupported(number) => {
+                ExceptionEvent::Unsupported(number, pc) => {
                     return Err(CoreRunError::Exception(format!(
-                        "unsupported Unicorn ARM interrupt {number}"
+                        "unsupported Unicorn ARM interrupt {number} at {pc:#010x}"
                     )))
                 }
                 ExceptionEvent::Failure(error) => return Err(CoreRunError::Exception(error)),
@@ -388,8 +402,23 @@ impl ArmV7Core {
         self.engine.add_intr_hook(move |engine, interrupt| {
             let event = match interrupt {
                 2 => ExceptionEvent::Svc,
-                8 => ExceptionEvent::Return,
-                number => ExceptionEvent::Unsupported(number),
+                8 => {
+                    let pc = engine.reg_read(RegisterARM::PC).unwrap_or_default() as u32;
+                    let lr = engine.reg_read(RegisterARM::LR).unwrap_or_default() as u32;
+                    let sp = engine.reg_read(RegisterARM::SP).unwrap_or_default() as u32;
+                    let mut stacked_pc = [0_u8; 4];
+                    let stacked_pc = sp.checked_sub(4).and_then(|address| {
+                        engine
+                            .mem_read(u64::from(address), &mut stacked_pc)
+                            .ok()
+                            .map(|()| u32::from_le_bytes(stacked_pc))
+                    });
+                    ExceptionEvent::Return { pc, lr, stacked_pc }
+                }
+                number => ExceptionEvent::Unsupported(
+                    number,
+                    engine.reg_read(RegisterARM::PC).unwrap_or_default() as u32,
+                ),
             };
             *interrupt_event.borrow_mut() = Some(event);
             let _ = engine.emu_stop();
@@ -468,7 +497,7 @@ fn enter_exception<'a>(engine: &mut Unicorn<'a, ()>, exception: u16) -> Result<(
 
 fn return_from_exception<'a>(engine: &mut Unicorn<'a, ()>) -> Result<(), String> {
     let exc_return = read_register(engine, RegisterARM::LR)? as u32;
-    if exc_return & 0xffff_ffe0 != 0xffff_ffe0 || exc_return & 1 == 0 {
+    if !is_exception_return(exc_return) {
         return Err(format!("invalid exception-return token {exc_return:#010x}"));
     }
     let stack_register = if exc_return & 4 != 0 {
@@ -507,6 +536,10 @@ fn return_from_exception<'a>(engine: &mut Unicorn<'a, ()>) -> Result<(), String>
     write_register(engine, RegisterARM::CPSR, cpsr)?;
     write_register(engine, RegisterARM::PC, u64::from(frame[6] & !1))?;
     Ok(())
+}
+
+fn is_exception_return(value: u32) -> bool {
+    value & 0xffff_ffe0 == 0xffff_ffe0 && value & 1 != 0
 }
 
 fn read_register(engine: &Unicorn<'_, ()>, register: RegisterARM) -> Result<u64, String> {
@@ -553,7 +586,18 @@ mod tests {
         core.map_region(u32::from(SCS_BASE), PAGE_SIZE as usize, Prot::ALL)
             .unwrap();
         core.load_bytes(0x1000, &[0x00, 0xdf, 0x2a, 0x20]).unwrap();
-        core.load_bytes(0x1100, &[0x00, 0xb5, 0x00, 0xbd]).unwrap();
+        core.load_bytes(
+            0x1100,
+            &[
+                0x00, 0xb5, // push {lr}
+                0x01, 0x48, // ldr r0, [pc, #4]
+                0x80, 0x47, // blx r0
+                0x00, 0xbd, // pop {pc}
+                0x0d, 0x11, 0x00, 0x00, // helper address, Thumb
+                0x70, 0x47, // helper: bx lr
+            ],
+        )
+        .unwrap();
         core.load_bytes(SCB_VTOR, &0x2000_u32.to_le_bytes())
             .unwrap();
         core.load_bytes(
@@ -565,7 +609,7 @@ mod tests {
         core.set_register(RegisterARM::PSP, 0x1ff4).unwrap();
         core.set_register(RegisterARM::CONTROL, 2).unwrap();
 
-        assert_eq!(core.run(0x1001, 4).unwrap(), 0x1004);
+        assert_eq!(core.run(0x1001, 7).unwrap(), 0x1004);
         assert_eq!(core.register(RegisterARM::R0).unwrap(), 0x2a);
         assert_eq!(core.register(RegisterARM::IPSR).unwrap(), 0);
         assert_eq!(core.register(RegisterARM::PSP).unwrap(), 0x1ff4);

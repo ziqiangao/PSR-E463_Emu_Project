@@ -16,10 +16,10 @@ external flash commands.
 This is not yet a complete hardware emulator. Normal firmware execution still
 stalls at the Yamaha boot screen and has not reached the `GrandPno` milestone.
 The LCD path is fine: firmware writes `Yamaha`, then the RTOS idles with no
-ready task while waiting on event 4 during flash/backup bring-up. The correct
-wake/interrupt source for that wait is unresolved, and boot from erased flash
-has not been verified through to the main screen. Several startup peripheral
-stand-ins are approximations, not hardware models. Physical input matrix
+ready task while waiting on driver wait key 4 during flash/backup bring-up.
+The correct wake/interrupt source for that wait is unresolved, and boot from
+erased flash has not been verified through to the main screen. Several startup
+peripheral stand-ins are approximations, not hardware models. Physical input matrix
 wiring, USB device behavior, and audio output remain incomplete. See the
 2026-10-22 notes in
 [NOTES_EMULATOR_REQUIREMENTS.md](./NOTES_EMULATOR_REQUIREMENTS.md).
@@ -50,7 +50,8 @@ cargo run -- --force-test-mode
 
 `--force-test-mode` injects the firmware's observed C#2, F2, and G#2 startup
 scan samples; it does not guarantee test-mode entry while task waking is
-unresolved. The debugger also supports an opt-in one-shot event-4 wait bypass:
+unresolved. The debugger also supports an opt-in one-shot driver key-4 wait
+bypass:
 
 ```sh
 cargo run -- --debug-firmware --diagnostic-wake-event4
